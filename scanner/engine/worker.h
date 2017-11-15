@@ -28,6 +28,58 @@
 namespace scanner {
 namespace internal {
 
+class OpStage {
+  public:
+    OpStage(i32 kg, bool is_last)
+      : busy_(false),
+        kg_(kg),
+        is_last_(is_last) {}
+    bool is_last() {return is_last_;}
+    bool is_busy() {return busy_;}
+    void free() {busy_ = false;}
+    void occupy() {busy_ = true;}
+    i32 kg() {return kg_;}
+    void add_child(i32 kg) {children.push_back(kg);}
+    
+    std::vector<i32> children;
+  private:
+    bool busy_;
+    i32 kg_;
+    bool is_last_;
+};
+
+struct SchedulerArgs{
+  // Num worker threads
+  i32 num_eval_threads;
+  // Num instances
+  i32 pipeline_instances_per_node;
+  // PreEvaluator Queues
+  std::vector<EvalQueue> &pre_output_queues;
+  // PostEvaluator Queues
+  std::vector<EvalQueue> &post_input_queues;
+  // Intermediate Queue
+  IntermediateQueue &result_queue;
+  // Assign task Queues
+  std::vector<IntermediateQueue> &task_queues;
+  // Pipeline status
+  std::vector<std::vector<OpStage>> &pipeline_status;
+
+  SchedulerArgs(std::vector<EvalQueue> &pre,
+      std::vector<EvalQueue> &post,
+      IntermediateQueue &result, 
+      std::vector<IntermediateQueue> &task,
+      std::vector<std::vector<OpStage>> &pipeline)
+   : pre_output_queues(pre),
+     post_input_queues(post),
+     result_queue(result),
+     task_queues(task),
+     pipeline_status(pipeline) {} 
+};
+
+struct WorkerThreadArgs {
+  i32 id;
+};
+
 class WorkerImpl final : public proto::Worker::Service {
  public:
   WorkerImpl(DatabaseParameters& db_params, std::string master_address,

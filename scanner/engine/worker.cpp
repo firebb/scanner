@@ -58,6 +58,221 @@ inline bool operator!=(const MemoryPoolConfig& lhs,
   return !(lhs == rhs);
 }
 
+i32 wait_for_input(std::vector<EvalQueue> &pre_output_queues,
+            std::tuple<std::deque<TaskStream>, EvalWorkEntry> &input) {
+  for (i32 pu = 0; pu < pre_output_queues.size(); pu++) {
+    EvalQueue &input_work_queue = pre_output_queues[pu];
+    if (input_work_queue.try_pop(input)) {
+      return pu;
+    }
+  }
+  return -1;
+}
+
+bool has_work_to_do(
+    std::deque<Intermediate> &buffer_queues,
+    std::vector<std::vector<OpStage>> &pipeline_status,
+    Intermediate &work_togo) {
+  i32 buffered_works = buffer_queues.size();
+  if (buffered_works == 0) return false;
+
+  for (i32 i = 0; i < buffered_works; i++) {
+    Intermediate inter = buffer_queues.front();
+    buffer_queues.pop_front();
+    i32 pu = inter.pu;
+    i32 kg = inter.kg;
+    if (!pipeline_status[pu][kg].is_busy()) {
+      work_togo = inter;
+      return true;
+    } else {
+      buffer_queues.push_back(inter);
+    }
+  }
+  return false;
+}
+
+void schedule(SchedulerArgs args) {
+  std::deque<i32> free_workers;
+  i32 num_eval_threads = args.num_eval_threads;
+  i32 num_active_threads = num_eval_threads;
+  i32 pipeline_instances_per_node = args.pipeline_instances_per_node;
+  std::vector<EvalQueue> &pre_output_queues = args.pre_output_queues;
+  std::vector<EvalQueue> &post_input_queues = args.post_input_queues;
+  IntermediateQueue &result_queue = args.result_queue;
+  std::vector<IntermediateQueue> &task_queues = args.task_queues;
+  std::vector<std::vector<OpStage>> &pipeline_status = args.pipeline_status;
+  std::deque<Intermediate> buffer_queues;
+
+  for (i32 wid = 0; wid < num_eval_threads; wid++) {
+    free_workers.push_back(wid);
+  }
+  
+  VLOG(1) << "firebb scheduler start "; 
+
+  while (true) {
+    if (free_workers.size() == 0) {
+      Intermediate finished;
+      result_queue.pop(finished);
+      if (finished.is_last) {
+        num_active_threads --;
+        if (num_active_threads == 0) {
+          VLOG(1) << "firebb scheduler exit "; 
+          return; // Terminate scheduler thread
+        }
+        continue;
+      }
+      free_workers.push_back(finished.wid);
+      VLOG(1) << "Scheduler receive result from worker " << finished.wid;
+      i32 pu = finished.pu;
+      i32 kg = finished.kg;
+      EvalWorkEntry& work_entry = finished.entry;
+      auto& task_streams = finished.task_streams;
+
+      //TODO: has_result
+
+      OpStage &stage = pipeline_status[pu][kg];
+      stage.free();
+      if (stage.is_last()) {
+        VLOG(1) << "firebb worker " << finished.wid <<
+          " push result to post eval";
+        post_input_queues[pu].push(
+            std::make_tuple(task_streams, work_entry));
+      } else {
+        for (i32 stage_id: stage.children) {
+          Intermediate next;
+          next.pu = pu;
+          next.kg = stage_id;
+          next.task_streams = task_streams;
+          next.entry = work_entry;
+          VLOG(1) << "firebb new work " << pu << ":" << stage_id << ":";
+          buffer_queues.push_back(next);
+        }
+      }
+    }
+
+    Intermediate work_togo;
+    while (!has_work_to_do(buffer_queues, pipeline_status, work_togo)) {
+      i32 pu = -1;
+      std::tuple<std::deque<TaskStream>, EvalWorkEntry> input;
+      if ((pu = wait_for_input(pre_output_queues, input)) == -1) {
+        Intermediate finished;
+        if (result_queue.try_pop(finished)) {
+          if (finished.is_last) {
+            num_active_threads --;
+            if (num_active_threads == 0) {
+              VLOG(1) << "firebb scheduler exit "; 
+              return; // Terminate scheduler thread
+            }
+            continue;
+          }
+          VLOG(1) << "Scheduler receive result from worker " << finished.wid;
+          free_workers.push_back(finished.wid);
+          i32 pu = finished.pu;
+          i32 kg = finished.kg;
+          EvalWorkEntry& work_entry = finished.entry;
+          auto& task_streams = finished.task_streams;
+
+          //TODO: has_result
+
+          OpStage &stage = pipeline_status[pu][kg];
+          stage.free();
+          if (stage.is_last()) {
+            post_input_queues[pu].push(
+                std::make_tuple(task_streams, work_entry));
+          } else {
+            for (i32 stage_id: stage.children) {
+              Intermediate next;
+              next.pu = pu;
+              next.kg = stage_id;
+              next.task_streams = task_streams;
+              next.entry = work_entry;
+              buffer_queues.push_back(next);
+            }
+          }
+        } else {
+          std::this_thread::yield();
+        }
+      } else {
+        Intermediate next;
+        next.pu = pu;
+        next.kg = 0; // first kernal group after pre_eval
+        next.task_streams = std::get<0>(input);
+        next.entry = std::get<1>(input); 
+        buffer_queues.push_back(next);
+      }
+    }
+
+    assert(free_workers.size() != 0);
+    // Assign work
+    i32 wid = free_workers.front();
+    VLOG(1) << "Scheduler assign work "<< work_togo.entry.job_index
+            << ", " << work_togo.entry.task_index << " to worker " << wid;
+    free_workers.pop_front();
+
+    task_queues[wid].push(work_togo);
+    pipeline_status[work_togo.pu][work_togo.kg].occupy();
+  }
+}
+
+void worker_thread(IntermediateQueue &task_queue,
+    IntermediateQueue &result_queue,
+    std::vector<std::vector<EvaluateWorker*>> &pipeline_stages,
+    std::vector<std::vector<EvaluateWorkerArgs>> &eval_args,
+    i32 wid) {
+
+  while (true) {
+    Intermediate inter;
+    task_queue.pop(inter);
+    if (inter.is_last) {
+      VLOG(1) << "Worker thread " << wid << " exit";
+      Intermediate res;
+      res.is_last = true;
+      result_queue.push(res);
+      return;
+    }
+
+    EvalWorkEntry& work_entry = inter.entry;
+    auto& task_streams = inter.task_streams;
+
+		i32 pu = inter.pu;
+		i32 kg = inter.kg;
+		VLOG(2) << "Evaluate (N/KI/G: " << wid << "/" << pu << "/"
+            << kg << "): processing job task " << work_entry.job_index
+            << ", " << work_entry.task_index;
+    auto work_start = now();
+    EvaluateWorker &worker = std::ref(*pipeline_stages.at(pu).at(kg)); 
+
+    if (task_streams.size() > 0) {
+      // Start of a new task. Tell kernels what outputs they should produce.
+      std::vector<TaskStream> streams;
+      for (i32 i = 0;
+          i < eval_args[pu][kg].arg_group.kernel_factories.size();
+          ++i) {
+        assert(!task_streams.empty());
+        streams.push_back(task_streams.front());
+        task_streams.pop_front();
+      }
+      worker.new_task(work_entry.job_index, work_entry.task_index, streams);
+    }
+    
+    auto input_entry = work_entry;
+    worker.feed(input_entry);
+    EvalWorkEntry output_entry;
+    // TODO: item size is not used in yield now.
+    bool result = worker.yield(0, output_entry);
+    (void) result;
+    assert(result);
+
+    VLOG(2) << "Evaluate (N/KI/G: " << wid << "/" << pu << "/"
+            << kg << "): finished task " << work_entry.job_index
+            << ", " << work_entry.task_index << " in " << 
+            std::chrono::duration_cast<std::chrono::milliseconds>(now() - work_start).count()
+            << "ms";
+    result_queue.push(Intermediate{pu, kg, task_streams, output_entry,
+        wid, 1});
+  }
+}
+
 void load_driver(LoadInputQueue& load_work,
                  std::vector<EvalQueue>& initial_eval_work,
                  LoadWorkerArgs args) {
@@ -129,6 +344,7 @@ void pre_evaluate_driver(EvalQueue& input_work, EvalQueue& output_work,
   i32 work_packet_size = args.work_packet_size;
 
   std::tuple<i32, i32> active_job_task = std::make_tuple(-1, -1);
+  VLOG(1) << "pre_eval_driver " << std::this_thread::get_id() <<" starts";
   while (true) {
     auto idle_start = now();
 
@@ -285,6 +501,11 @@ void evaluate_driver(EvalQueue& input_work, EvalQueue& output_work,
     assert(result);
 
     profiler.add_interval("task", work_start, now());
+    VLOG(2) << "Evaluate (N/KI/G: " << args.node_id << "/" << args.ki << "/"
+            << args.kg << "): finished task " << work_entry.job_index
+            << ", " << work_entry.task_index << " in " << 
+            std::chrono::duration_cast<std::chrono::milliseconds>(now() - work_start).count()
+            << "ms";
 
     auto idle_push_start = now();
     output_work.push(std::make_tuple(task_streams, output_entry));
@@ -663,26 +884,22 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     kernel_configs.push_back(kernel_config);
   }
 
+  VLOG(1) << "firebb: op" << ops.at(0).name();
   // Break up kernels into groups that run on the same device
   std::vector<OpArgGroup> groups;
   if (!kernel_factories.empty()) {
     bool first_op = true;
     DeviceType last_device_type;
-    groups.emplace_back();
     for (size_t i = 1; i < kernel_factories.size() - 1; ++i) {
       KernelFactory* factory = kernel_factories[i];
+      /*
+       * firebb: hack to ignore input since remapped
+       */
+      if (ops.at(i).name() == INPUT_OP_NAME)
+        continue;
       // Factory is nullptr when we are on a builtin op
-      if (factory != nullptr && first_op) {
-        last_device_type = factory->get_device_type();
-        first_op = false;
-      }
-      if (factory != nullptr &&
-          factory->get_device_type() != last_device_type) {
-        // Does not use the same device as previous kernel, so push into new
-        // group
-        last_device_type = factory->get_device_type();
-        groups.emplace_back();
-      }
+      VLOG(1) << "firebb: op" << ops.at(i).name();
+      groups.emplace_back();
       auto& op_group = groups.back().op_names;
       auto& op_sampling = groups.back().sampling_args;
       auto& group = groups.back().kernel_factories;
@@ -739,8 +956,10 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       bt.push_back(analysis_results.batch_sizes[i]);
     }
   }
+  VLOG(1) << "firebb: op" << ops.at(kernel_factories.size() - 1).name();
 
   i32 num_kernel_groups = static_cast<i32>(groups.size());
+  VLOG(1) << "firebb num of kernel groups: " << num_kernel_groups;
   assert(num_kernel_groups > 0);  // is this actually necessary?
 
   i32 pipeline_instances_per_node = job_params->pipeline_instances_per_node();
@@ -840,7 +1059,26 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
                               std::ref(initial_eval_work), args);
   }
 
-  // Setup evaluate workers
+  // Setup Scheduler and evaluate workers
+  i32 num_eval_threads = job_params->num_eval_threads();
+  VLOG(1) << "Num worker threads: " << num_eval_threads;
+
+  std::vector<EvalQueue> post_input_queues(pipeline_instances_per_node);
+  std::vector<EvalQueue> pre_output_queues(pipeline_instances_per_node);
+  IntermediateQueue result_queue;
+  std::vector<IntermediateQueue> task_queues(num_eval_threads);
+  std::vector<std::vector<OpStage>> pipeline_status(
+      pipeline_instances_per_node);
+
+  SchedulerArgs sArgs(pre_output_queues,
+                      post_input_queues,
+                      result_queue,
+                      task_queues,
+                      pipeline_status);
+  sArgs.num_eval_threads = num_eval_threads;
+  sArgs.pipeline_instances_per_node = pipeline_instances_per_node;
+
+  // Set up all other queues
   std::vector<std::vector<Profiler>> eval_profilers(
       pipeline_instances_per_node);
   std::vector<std::vector<proto::Result>> eval_results(
@@ -855,17 +1093,38 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   std::vector<std::tuple<EvalQueue*, OutputEvalQueue*>> post_eval_queues;
   std::vector<PostEvaluateWorkerArgs> post_eval_args;
 
+  // For worker threads
+  std::vector<std::vector<EvaluateWorker *>> pipeline_stages(
+      pipeline_instances_per_node);
+
   i32 next_cpu_num = 0;
   i32 next_gpu_idx = 0;
   std::mutex startup_lock;
   std::condition_variable startup_cv;
   i32 startup_count = 0;
   i32 eval_total = 0;
+
+  // Set up the pipeline status
+  for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
+    auto& status = pipeline_status[pu];
+
+    for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
+      status.emplace_back(kg, kg == num_kernel_groups - 1);
+      // Hack to schedule the linear pipeline since the DAG is
+      // topologically sorted.
+      if (kg != num_kernel_groups - 1) {
+        status.at(kg).add_child(kg + 1);
+      }
+    }
+  }
+
   for (i32 ki = 0; ki < pipeline_instances_per_node; ++ki) {
     auto& work_queues = eval_work[ki];
+    auto& status = pipeline_status[ki]; 
+
     std::vector<Profiler>& eval_thread_profilers = eval_profilers[ki];
     std::vector<proto::Result>& results = eval_results[ki];
-    work_queues.resize(num_kernel_groups - 1 + 2);  // +2 for pre/post
+    work_queues.resize(num_kernel_groups); 
     results.resize(num_kernel_groups);
     for (auto& result : results) {
       result.set_success(true);
@@ -877,6 +1136,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     // Evaluate worker
     DeviceHandle first_kernel_type;
     for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
+      status.emplace_back(kg, kg == num_kernel_groups - 1);
       auto& group = groups[kg].kernel_factories;
       std::vector<EvaluateWorkerArgs>& thread_args = eval_args[ki];
       std::vector<std::tuple<EvalQueue*, EvalQueue*>>& thread_qs =
@@ -923,9 +1183,19 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       }
 
       // Input work queue
-      EvalQueue* input_work_queue = &work_queues[kg];
+      EvalQueue* input_work_queue;
+      if (kg == 0) {
+        input_work_queue = &pre_output_queues[ki];
+      } else {
+        input_work_queue = &work_queues[kg];
+      }
       // Create new queue for output, reuse previous queue as input
-      EvalQueue* output_work_queue = &work_queues[kg + 1];
+      EvalQueue* output_work_queue;
+      if (kg == num_kernel_groups - 1) {
+        output_work_queue = &post_input_queues[ki];
+      } else {
+        output_work_queue = &work_queues[kg + 1];
+      }
       // Create eval thread for passing data through neural net
       thread_qs.push_back(
           std::make_tuple(input_work_queue, output_work_queue));
@@ -945,8 +1215,10 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       } else {
         input_work_queue = &initial_eval_work[0];
       }
+      //EvalQueue* output_work_queue =
+      //    &work_queues[0];
       EvalQueue* output_work_queue =
-          &work_queues[0];
+          &pre_output_queues[ki];
       assert(groups.size() > 0);
       pre_eval_queues.push_back(
           std::make_tuple(input_work_queue, output_work_queue));
@@ -970,7 +1242,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
         column_names.push_back(op_input.column());
       }
 
-      EvalQueue* input_work_queue = &work_queues.back();
+      EvalQueue* input_work_queue = &post_input_queues[ki];
       OutputEvalQueue* output_work_queue = &output_eval_work;
       post_eval_queues.push_back(
           std::make_tuple(input_work_queue, output_work_queue));
@@ -987,7 +1259,8 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
 
   // Launch eval worker threads
   std::vector<std::thread> pre_eval_threads;
-  std::vector<std::vector<std::thread>> eval_threads;
+  //std::vector<std::vector<std::thread>> eval_threads;
+  std::vector<std::thread> eval_threads;
   std::vector<std::thread> post_eval_threads;
   for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
     // Pre thread
@@ -995,17 +1268,30 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
         pre_evaluate_driver, std::ref(*std::get<0>(pre_eval_queues[pu])),
         std::ref(*std::get<1>(pre_eval_queues[pu])), pre_eval_args[pu]);
     // Op threads
-    eval_threads.emplace_back();
-    std::vector<std::thread>& threads = eval_threads.back();
+    //eval_threads.emplace_back();
+    //std::vector<std::thread>& threads = eval_threads.back();
+    std::vector<EvaluateWorker *>& stages = pipeline_stages[pu];
     for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
-      threads.emplace_back(
-          evaluate_driver, std::ref(*std::get<0>(eval_queues[pu][kg])),
-          std::ref(*std::get<1>(eval_queues[pu][kg])), eval_args[pu][kg]);
+      //threads.emplace_back(
+      //    evaluate_driver, std::ref(*std::get<0>(eval_queues[pu][kg])),
+      //    std::ref(*std::get<1>(eval_queues[pu][kg])), eval_args[pu][kg]);
+      EvaluateWorkerArgs& args = std::ref(eval_args[pu][kg]);
+      stages.push_back(new EvaluateWorker(args));
     }
     // Post threads
     post_eval_threads.emplace_back(
         post_evaluate_driver, std::ref(*std::get<0>(post_eval_queues[pu])),
         std::ref(*std::get<1>(post_eval_queues[pu])), post_eval_args[pu]);
+  }
+
+  std::thread scheduler_thread(schedule, sArgs);
+
+  for (i32 wid = 0; wid < num_eval_threads; ++wid) {
+    eval_threads.emplace_back(worker_thread,
+        std::ref(task_queues[wid]),
+        std::ref(result_queue),
+        std::ref(pipeline_stages),
+        std::ref(eval_args), wid);
   }
 
   // Setup save coordinator
@@ -1022,7 +1308,6 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   for (i32 i = 0; i < num_save_workers; ++i) {
     SaveWorkerArgs args{// Uniform arguments
                         node_id_,
-
                         // Per worker arguments
                         i, db_params_.storage_config, save_thread_profilers[i]};
 
@@ -1037,6 +1322,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       return eval_total == startup_count;
     });
   }
+  VLOG(1) << "worker all started!";
 
   timepoint_t start_time = now();
 
@@ -1183,13 +1469,20 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       }
     }
     for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
-      eval_work[pu].back().clear();
+      post_input_queues[pu].clear();
     }
     output_eval_work.clear();
     for (i32 i = 0; i < num_save_workers; ++i) {
       save_work[i].clear();
     }
+    // TODO: clear pre_out and post_in
   }
+
+  auto push_worker_thread_exit_message = [](IntermediateQueue& q) {
+    Intermediate inter;
+    inter.is_last = true;
+    q.push(inter);
+  };
 
   auto push_exit_message = [](EvalQueue& q) {
     EvalWorkEntry entry;
@@ -1233,28 +1526,29 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
 
   for (i32 i = 0; i < pipeline_instances_per_node; ++i) {
     // Wait until pre eval has finished
-    LOG(INFO) << "Pre join " << i;
     pre_eval_threads[i].join();
   }
 
-  for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
-    for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
-      push_exit_message(eval_work[pu][kg]);
-    }
-    for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
-      // Wait until eval has finished
-      eval_threads[pu][kg].join();
-    }
-  }
-
+  //for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
+  //  for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
+  //    push_exit_message(eval_work[pu][kg]);
+  //  }
+  //  for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
+  //    // Wait until eval has finished
+  //    eval_threads[pu][kg].join();
+  //  }
+  //}
+  
+  VLOG(1) << "signal post_eval finish!";
   // Terminate post eval threads
   for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
-    push_exit_message(eval_work[pu].back());
+    push_exit_message(post_input_queues[pu]);
   }
   for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
     // Wait until eval has finished
     post_eval_threads[pu].join();
   }
+  VLOG(1) << "post eval finished";
 
   // Push sentinel work entries into queue to terminate coordinator thread
   push_output_eval_exit_message(output_eval_work);
@@ -1268,6 +1562,18 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     // Wait until eval has finished
     save_threads[i].join();
   }
+
+  // Terminate worker threads
+  VLOG(1) << "signal worker finish!";
+  for (i32 i = 0; i < num_eval_threads; i++) {
+    push_worker_thread_exit_message(task_queues[i]);
+  }
+  for (i32 i = 0; i < num_eval_threads; i++) {
+    eval_threads[i].join();
+  }
+
+  // Terminate scheduler
+  scheduler_thread.join();
 
   // Ensure all files are flushed
   if (job_params->profiling()) {
@@ -1317,7 +1623,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   // Evaluate worker profilers
   u8 eval_worker_count = pipeline_instances_per_node;
   s_write(profiler_output.get(), eval_worker_count);
-  u8 profilers_per_chain = 3;
+  u8 profilers_per_chain = num_kernel_groups + 2;
   s_write(profiler_output.get(), profilers_per_chain);
   for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
     i32 i = pu;
@@ -1326,15 +1632,15 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       write_profiler_to_file(profiler_output.get(), out_rank, "eval", tag, i,
                              eval_profilers[pu][0]);
     }
-    {
+    for (i32 kg = 1; kg < num_kernel_groups + 1; kg++) {
       std::string tag = "eval";
       write_profiler_to_file(profiler_output.get(), out_rank, "eval", tag, i,
-                             eval_profilers[pu][1]);
+                             eval_profilers[pu][kg]);
     }
     {
       std::string tag = "post";
       write_profiler_to_file(profiler_output.get(), out_rank, "eval", tag, i,
-                             eval_profilers[pu][2]);
+                             eval_profilers[pu][num_kernel_groups + 1]);
     }
   }
 

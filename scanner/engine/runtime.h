@@ -69,10 +69,23 @@ struct TaskStream {
   std::vector<i64> valid_output_rows;
 };
 
+struct Intermediate {
+  i32 pu;
+  i32 kg;
+  std::deque<TaskStream> task_streams;
+  EvalWorkEntry entry;
+  // For pipeline stage results
+  i32 wid;
+  i32 has_result; 
+  bool is_last = false;
+};
+
 using LoadInputQueue =
     Queue<std::tuple<i32, std::deque<TaskStream>, LoadWorkEntry>>;
 using EvalQueue =
     Queue<std::tuple<std::deque<TaskStream>, EvalWorkEntry>>;
+using IntermediateQueue = 
+    Queue<Intermediate>;
 using OutputEvalQueue =
     Queue<std::tuple<i32, EvalWorkEntry>>;
 using SaveInputQueue =
