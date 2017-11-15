@@ -1240,6 +1240,9 @@ Result derive_stencil_requirements(
               return result;
             }
           }
+        } else {
+          /*firebb: hack to ignore input ops since remapped*/
+          continue;
         }
       }
       // Sample or Space Op

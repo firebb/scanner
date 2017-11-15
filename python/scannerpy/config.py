@@ -47,8 +47,8 @@ class Config(object):
             storage_config = self._make_storage_config(config)
 
             self.master_address = 'localhost'
-            self.master_port = '5001'
-            self.worker_port = '5002'
+            self.master_port = '5005'
+            self.worker_port = '5006'
             if 'network' in config:
                 network = config['network']
                 if 'master' in network:
@@ -110,8 +110,8 @@ class Config(object):
             },
             'network': {
                 'master': hostname,
-                'master_port': '5001',
-                'worker_port': '5002'
+                'master_port': '5005',
+                'worker_port': '5006'
             }
         }
 

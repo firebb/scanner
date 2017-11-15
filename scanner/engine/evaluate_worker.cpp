@@ -244,7 +244,7 @@ EvaluateWorker::EvaluateWorker(const EvaluateWorkerArgs& args)
 #endif
       auto kernel = factory->new_instance(config);
       kernel->validate(&args.result);
-      VLOG(1) << "Kernel finished validation " << args.result.success();
+      LOG(INFO) << "Kernel finished validation " << args.result.success();
       if (!args.result.success()) {
         LOG(ERROR) << "Kernel validate failed: " << args.result.msg();
         THREAD_RETURN_SUCCESS();
