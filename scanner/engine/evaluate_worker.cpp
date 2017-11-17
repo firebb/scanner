@@ -341,7 +341,7 @@ void EvaluateWorker::new_task(i64 job_idx, i64 task_idx,
   clear_stencil_cache();
 }
 
-void EvaluateWorker::feed(EvalWorkEntry& work_entry) {
+void EvaluateWorker::feed(EvalWorkEntry& work_entry, Profiler& profiler) {
   entry_ = work_entry;
 
   auto feed_start = now();
@@ -415,9 +415,9 @@ void EvaluateWorker::feed(EvalWorkEntry& work_entry) {
       if (valid_inputs.size() > 0) {
         auto copy_start = now();
         ElementList list =
-            copy_or_ref_elements(profiler_, side_output_handles[in_col_idx],
+            copy_or_ref_elements(profiler, side_output_handles[in_col_idx],
                                  current_handle, valid_inputs);
-        profiler_.add_interval("op_marshal", copy_start, now());
+        profiler.add_interval("op_marshal", copy_start, now());
         // Insert new elements into cache
         kernel_cache[i].insert(kernel_cache[i].end(), list.begin(), list.end());
       }
@@ -640,7 +640,7 @@ void EvaluateWorker::feed(EvalWorkEntry& work_entry) {
         // by the kernel
         auto eval_start = now();
         kernel->execute_kernel(input_columns, output_columns);
-        profiler_.add_interval("evaluate:" + op_name, eval_start, now());
+        profiler.add_interval("evaluate:" + op_name, eval_start, now());
 
         // Delete unused output columns
         auto& unused_outputs = arg_group_.unused_outputs[k];
@@ -784,10 +784,10 @@ void EvaluateWorker::feed(EvalWorkEntry& work_entry) {
                              side_row_ids[i].end());
   }
 
-  profiler_.add_interval("feed", feed_start, now());
+  profiler.add_interval("feed", feed_start, now());
 }
 
-bool EvaluateWorker::yield(i32 item_size, EvalWorkEntry& output_entry) {
+bool EvaluateWorker::yield(i32 item_size, EvalWorkEntry& output_entry, Profiler &profiler) {
   EvalWorkEntry& work_entry = entry_;
 
   auto yield_start = now();
@@ -825,7 +825,7 @@ bool EvaluateWorker::yield(i32 item_size, EvalWorkEntry& output_entry) {
 
   output_entry = output_work_entry;
 
-  profiler_.add_interval("yield", yield_start, now());
+  profiler.add_interval("yield", yield_start, now());
 
   return true;
 }

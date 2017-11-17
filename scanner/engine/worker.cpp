@@ -218,6 +218,7 @@ void worker_thread(IntermediateQueue &task_queue,
     IntermediateQueue &result_queue,
     std::vector<std::vector<EvaluateWorker*>> &pipeline_stages,
     std::vector<std::vector<EvaluateWorkerArgs>> &eval_args,
+    Profiler& profiler,
     i32 wid) {
 
   while (true) {
@@ -256,10 +257,10 @@ void worker_thread(IntermediateQueue &task_queue,
     }
     
     auto input_entry = work_entry;
-    worker.feed(input_entry);
+    worker.feed(input_entry, profiler);
     EvalWorkEntry output_entry;
     // TODO: item size is not used in yield now.
-    bool result = worker.yield(0, output_entry);
+    bool result = worker.yield(0, output_entry, profiler);
     (void) result;
     assert(result);
 
@@ -494,9 +495,9 @@ void evaluate_driver(EvalQueue& input_work, EvalQueue& output_work,
     }
 
     auto input_entry = work_entry;
-    worker.feed(input_entry);
+    worker.feed(input_entry, profiler);
     EvalWorkEntry output_entry;
-    bool result = worker.yield(work_packet_size, output_entry);
+    bool result = worker.yield(work_packet_size, output_entry, profiler);
     (void)result;
     assert(result);
 
@@ -1079,8 +1080,6 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   sArgs.pipeline_instances_per_node = pipeline_instances_per_node;
 
   // Set up all other queues
-  std::vector<std::vector<Profiler>> eval_profilers(
-      pipeline_instances_per_node);
   std::vector<std::vector<proto::Result>> eval_results(
       pipeline_instances_per_node);
 
@@ -1104,6 +1103,15 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   i32 startup_count = 0;
   i32 eval_total = 0;
 
+  std::vector<Profiler> eval_thread_profilers;
+  Profiler scheduler_profiler(base_time);
+  std::vector<Profiler> pre_eval_profilers;
+  std::vector<Profiler> post_eval_profilers;
+  // Set up eval_threads profilers
+  for (i32 wid = 0; wid < num_eval_threads; wid ++) {
+    eval_thread_profilers.push_back(Profiler(base_time));
+  }
+
   // Set up the pipeline status
   for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
     auto& status = pipeline_status[pu];
@@ -1116,34 +1124,31 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
         status.at(kg).add_child(kg + 1);
       }
     }
+
+    // Set up pipeline pre post profiler
+    pre_eval_profilers.push_back(Profiler(base_time));
+    post_eval_profilers.push_back(Profiler(base_time));
   }
 
   for (i32 ki = 0; ki < pipeline_instances_per_node; ++ki) {
     auto& work_queues = eval_work[ki];
-    auto& status = pipeline_status[ki]; 
 
-    std::vector<Profiler>& eval_thread_profilers = eval_profilers[ki];
     std::vector<proto::Result>& results = eval_results[ki];
     work_queues.resize(num_kernel_groups); 
     results.resize(num_kernel_groups);
     for (auto& result : results) {
       result.set_success(true);
     }
-    for (i32 i = 0; i < num_kernel_groups + 2; ++i) {
-      eval_thread_profilers.push_back(Profiler(base_time));
-    }
 
     // Evaluate worker
     DeviceHandle first_kernel_type;
     for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
-      status.emplace_back(kg, kg == num_kernel_groups - 1);
       auto& group = groups[kg].kernel_factories;
       std::vector<EvaluateWorkerArgs>& thread_args = eval_args[ki];
       std::vector<std::tuple<EvalQueue*, EvalQueue*>>& thread_qs =
           eval_queues[ki];
       // HACK(apoms): we assume all ops in a kernel group use the
       //   same number of devices for now.
-      // for (size_t i = 0; i < group.size(); ++i) {
       KernelFactory* factory = nullptr;
       for (size_t i = 0; i < group.size(); ++i) {
         if (std::get<0>(group[i]) != nullptr) {
@@ -1204,7 +1209,9 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
           node_id_, startup_lock, startup_cv, startup_count,
 
           // Per worker arguments
-          ki, kg, groups[kg], eval_thread_profilers[kg + 1], results[kg]});
+          // hack(firebb) hack profiler. TODO: use per eval thread
+          // profiler instead of kernel group profiler
+          ki, kg, groups[kg], scheduler_profiler, results[kg]});
       eval_total += 1;
     }
     // Pre evaluate worker
@@ -1230,7 +1237,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
           node_id_, num_cpus, job_params->work_packet_size(),
 
           // Per worker arguments
-          ki, decoder_type, eval_thread_profilers.front(),
+          ki, decoder_type, std::ref(pre_eval_profilers[ki]),
       });
     }
 
@@ -1251,7 +1258,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
           node_id_,
 
           // Per worker arguments
-          ki, eval_thread_profilers.back(), column_mapping.back(),
+          ki, std::ref(post_eval_profilers[ki]), column_mapping.back(),
           final_output_columns, final_compression_options,
       });
     }
@@ -1291,7 +1298,9 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
         std::ref(task_queues[wid]),
         std::ref(result_queue),
         std::ref(pipeline_stages),
-        std::ref(eval_args), wid);
+        std::ref(eval_args),
+        std::ref(eval_thread_profilers[wid]),
+        wid);
   }
 
   // Setup save coordinator
@@ -1613,7 +1622,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
 
   i64 out_rank = node_id_;
   // Load worker profilers
-  u8 load_worker_count = num_load_workers;
+  u8 load_worker_count = num_load_workers + num_eval_threads;
   s_write(profiler_output.get(), load_worker_count);
   for (i32 i = 0; i < num_load_workers; ++i) {
     write_profiler_to_file(profiler_output.get(), out_rank, "load", "", i,
@@ -1621,26 +1630,30 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   }
 
   // Evaluate worker profilers
-  u8 eval_worker_count = pipeline_instances_per_node;
-  s_write(profiler_output.get(), eval_worker_count);
-  u8 profilers_per_chain = num_kernel_groups + 2;
+  //u8 eval_worker_count = num_eval_threads;
+  //s_write(profiler_output.get(), eval_worker_count);
+  for (i32 wid = 0; wid < num_eval_threads; wid ++) {
+    std::string tag = "worker";
+    write_profiler_to_file(profiler_output.get(), out_rank, "eval", tag, wid,
+                             eval_thread_profilers[wid]);
+  }
+
+  // Pre/Post Evaluate worker profilers
+  u8 prepost_worker_count = pipeline_instances_per_node;
+  s_write(profiler_output.get(), prepost_worker_count);
+  u8 profilers_per_chain = 2;
   s_write(profiler_output.get(), profilers_per_chain);
   for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
     i32 i = pu;
     {
       std::string tag = "pre";
       write_profiler_to_file(profiler_output.get(), out_rank, "eval", tag, i,
-                             eval_profilers[pu][0]);
-    }
-    for (i32 kg = 1; kg < num_kernel_groups + 1; kg++) {
-      std::string tag = "eval";
-      write_profiler_to_file(profiler_output.get(), out_rank, "eval", tag, i,
-                             eval_profilers[pu][kg]);
+                             pre_eval_profilers[pu]);
     }
     {
       std::string tag = "post";
       write_profiler_to_file(profiler_output.get(), out_rank, "eval", tag, i,
-                             eval_profilers[pu][num_kernel_groups + 1]);
+                             post_eval_profilers[pu]);
     }
   }
 

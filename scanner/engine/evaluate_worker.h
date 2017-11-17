@@ -119,7 +119,6 @@ struct EvaluateWorkerArgs {
   proto::Result& result;
 };
 
-
 class EvaluateWorker {
  public:
   EvaluateWorker(const EvaluateWorkerArgs& args);
@@ -128,9 +127,9 @@ class EvaluateWorker {
   void new_task(i64 job_idx, i64 task_idx,
                 const std::vector<TaskStream>& task_streams);
 
-  void feed(EvalWorkEntry& entry);
+  void feed(EvalWorkEntry& entry, Profiler& profiler);
 
-  bool yield(i32 item_size, EvalWorkEntry& output);
+  bool yield(i32 item_size, EvalWorkEntry& output, Profiler& profiler);
 
  private:
   void clear_stencil_cache();
