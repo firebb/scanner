@@ -83,6 +83,14 @@ bool has_work_to_do(
     i32 kg = inter.kg;
     if (!pipeline_status[pu][kg].is_busy()) {
       work_togo = inter;
+      // Restore the task order
+      i++;
+      while (i < buffered_works) {
+        inter = buffer_queues.front();
+        buffer_queues.pop_front();
+        buffer_queues.push_back(inter);
+        i++;
+      }
       return true;
     } else {
       buffer_queues.push_back(inter);
@@ -133,7 +141,7 @@ void schedule(SchedulerArgs args) {
       OpStage &stage = pipeline_status[pu][kg];
       stage.free();
       if (stage.is_last()) {
-        VLOG(1) << "firebb worker " << finished.wid <<
+        VLOG(1) << "Scheduler worker " << finished.wid <<
           " push result to post eval";
         post_input_queues[pu].push(
             std::make_tuple(task_streams, work_entry));
@@ -144,7 +152,7 @@ void schedule(SchedulerArgs args) {
           next.kg = stage_id;
           next.task_streams = task_streams;
           next.entry = work_entry;
-          VLOG(1) << "firebb new work " << pu << ":" << stage_id << ":";
+          VLOG(1) << "Scheduler new work " << pu << ":" << stage_id << ":";
           buffer_queues.push_back(next);
         }
       }
@@ -186,6 +194,7 @@ void schedule(SchedulerArgs args) {
               next.kg = stage_id;
               next.task_streams = task_streams;
               next.entry = work_entry;
+              VLOG(1) << "Scheduler new work " << pu << ":" << stage_id << ":";
               buffer_queues.push_back(next);
             }
           }
@@ -206,7 +215,8 @@ void schedule(SchedulerArgs args) {
     // Assign work
     i32 wid = free_workers.front();
     VLOG(1) << "Scheduler assign work "<< work_togo.entry.job_index
-            << ", " << work_togo.entry.task_index << " to worker " << wid;
+            << ", " << work_togo.entry.task_index << " pu: " << work_togo.pu
+            << " kg: " << work_togo.kg << " to worker " << wid;
     free_workers.pop_front();
 
     task_queues[wid].push(work_togo);
