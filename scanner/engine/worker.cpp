@@ -62,6 +62,7 @@ i32 wait_for_input(std::vector<EvalQueue> &pre_output_queues,
   for (i32 pu = 0; pu < pre_output_queues.size(); pu++) {
     EvalQueue &input_work_queue = pre_output_queues[pu];
     if (input_work_queue.try_pop(input)) {
+      VLOG(1) << "Scheduler receive input from pu:" << pu;
       return pu;
     }
   }
@@ -69,15 +70,15 @@ i32 wait_for_input(std::vector<EvalQueue> &pre_output_queues,
 }
 
 bool has_work_to_do(
-    std::deque<Intermediate> &buffer_queues,
+    std::deque<Intermediate> &buffer_queue,
     std::vector<std::vector<bool>> &pipeline_status,
     Intermediate &work_togo) {
-  i32 buffered_works = buffer_queues.size();
+  i32 buffered_works = buffer_queue.size();
   if (buffered_works == 0) return false;
 
   for (i32 i = 0; i < buffered_works; i++) {
-    Intermediate inter = buffer_queues.front();
-    buffer_queues.pop_front();
+    Intermediate inter = buffer_queue.front();
+    buffer_queue.pop_front();
     i32 pu = inter.pu;
     i32 kg = inter.kg;
     if (!pipeline_status[pu][kg]) {
@@ -85,17 +86,127 @@ bool has_work_to_do(
       // Restore the task order
       i++;
       while (i < buffered_works) {
-        inter = buffer_queues.front();
-        buffer_queues.pop_front();
-        buffer_queues.push_back(inter);
+        inter = buffer_queue.front();
+        buffer_queue.pop_front();
+        buffer_queue.push_back(inter);
         i++;
       }
       return true;
     } else {
-      buffer_queues.push_back(inter);
+      buffer_queue.push_back(inter);
     }
   }
   return false;
+}
+
+void gen_next_stage_tasks(i32 pu, i32 kg, i32 num_post_col,
+    Profiler &profiler,
+    EvalWorkEntry& work_entry,
+    std::deque<TaskStream>& task_streams,
+    std::vector<OpStage> &pipeline_stages,
+    std::vector<std::vector<std::pair<i32, i32>>> &col_mapping,
+    std::deque<Intermediate>& buffer_queue,
+    std::vector<EvalQueue> &post_input_queues) {
+  std::set<i32> next_stages;
+  if (kg == -1) {
+    // kg == -1 indicates input from pre_eval
+    for (auto& col : col_mapping) {
+      for (auto& map : col) {
+        next_stages.insert(std::get<0>(map));
+      }
+    }
+  } else {
+    OpStage& stage = pipeline_stages[kg]; 
+    for (i32 stage_id: stage.children) {
+      next_stages.insert(stage_id);
+    }
+  }
+
+  // We pass the original columns to the first next stage and copy/ref
+  // the rest of columns for the others.
+  BatchedColumns& output_columns = work_entry.columns;
+  std::vector<std::vector<i64>>& output_row_ids = work_entry.row_ids;
+  std::vector<bool> need_copy;
+  need_copy.resize(output_columns.size(), false);
+
+  for (i32 stage_id : next_stages) {
+  	EvalWorkEntry new_entry;
+  	new_entry.table_id = work_entry.table_id;
+  	new_entry.job_index = work_entry.job_index;
+  	new_entry.task_index = work_entry.task_index;
+  	new_entry.needs_configure = work_entry.needs_configure;
+  	new_entry.needs_reset = work_entry.needs_reset;
+  	new_entry.last_in_io_packet = work_entry.last_in_io_packet;
+  	new_entry.last_in_task = work_entry.last_in_task;
+
+    i32 num_input_columns = 0; 
+    if (stage_id == -1) {
+      // Special handle for post_eval.
+      num_input_columns = num_post_col;
+    } else {
+      // For other stages
+      OpStage& stage = pipeline_stages[stage_id];
+      num_input_columns = stage.num_inputs();
+    }
+    new_entry.columns.resize(num_input_columns);
+    new_entry.row_ids.resize(num_input_columns);
+    new_entry.column_handles.resize(num_input_columns);
+
+    for (i32 col = 0; col < col_mapping.size(); col++) {
+      auto& mapping = col_mapping[col];
+      bool found = false;
+      for (auto& map : mapping) {
+        if (std::get<0>(map) == stage_id) {
+          i32 to_col = std::get<1>(map);
+          DeviceHandle handle = work_entry.column_handles[col];
+          //new_entry.columns[to_col]
+          if (need_copy[col]) {
+            ElementList list = 
+              copy_or_ref_elements(profiler, handle,
+                                 handle, output_columns[col]);
+            new_entry.columns[to_col].insert(new_entry.columns[to_col].end(),
+                                             list.begin(),
+                                             list.end());
+          } else {
+            new_entry.columns[to_col].insert(new_entry.columns[to_col].end(),
+                                             output_columns[col].begin(),
+                                             output_columns[col].end());
+            need_copy[col] = true;
+          }
+          new_entry.row_ids[to_col].insert(new_entry.row_ids[to_col].end(),
+                                           output_row_ids[col].begin(),
+                                           output_row_ids[col].end());
+          new_entry.column_handles[to_col] = handle;
+          found = true;
+          break;
+        }  
+      }
+      assert(found);
+    }
+
+    if (stage_id == -1) {
+      VLOG(1) << "Scheduler push result to post eval ";
+      post_input_queues[pu].push(
+          std::make_tuple(task_streams, new_entry));
+    } else {
+      Intermediate inter;
+      inter.pu = pu;
+      inter.kg = stage_id;
+      inter.entry = new_entry;
+      inter.task_streams = task_streams;
+
+      VLOG(1) << "Scheduler new stage task " << pu << "/" << stage_id;
+      buffer_queue.push_back(inter);
+    }
+  }
+
+  // Clear intermediate
+  for (i32 col = 0; col < col_mapping.size(); col++) {
+    // check if all outputs are used.
+    assert(need_copy[col]);
+    output_columns[col].clear();
+    output_row_ids.clear();
+  }
 }
 
 void schedule(SchedulerArgs args) {
@@ -103,13 +214,18 @@ void schedule(SchedulerArgs args) {
   i32 num_eval_threads = args.num_eval_threads;
   i32 num_active_threads = num_eval_threads;
   i32 pipeline_instances_per_node = args.pipeline_instances_per_node;
+
+  i32 num_post_col = args.num_post_col;
   std::vector<EvalQueue> &pre_output_queues = args.pre_output_queues;
   std::vector<EvalQueue> &post_input_queues = args.post_input_queues;
+  std::vector<std::vector<std::pair<i32, i32>>> &input_col_mapping =
+    args.input_col_mapping;
   IntermediateQueue &result_queue = args.result_queue;
   std::vector<IntermediateQueue> &task_queues = args.task_queues;
   std::vector<OpStage> &pipeline_stages = args.pipeline_stages;
   std::vector<std::vector<bool>> &pipeline_status = args.pipeline_status;
-  std::deque<Intermediate> buffer_queues;
+  std::deque<Intermediate> buffer_queue;
+  Profiler &profiler = args.profiler;
 
   for (i32 wid = 0; wid < num_eval_threads; wid++) {
     free_workers.push_back(wid);
@@ -140,26 +256,14 @@ void schedule(SchedulerArgs args) {
 
       OpStage &stage = pipeline_stages[kg];
       pipeline_status[pu][kg] = false;
-      if (stage.is_last()) {
-        VLOG(1) << "Scheduler worker " << finished.wid <<
-          " push result to post eval";
-        post_input_queues[pu].push(
-            std::make_tuple(task_streams, work_entry));
-      } else {
-        for (i32 stage_id: stage.children) {
-          Intermediate next;
-          next.pu = pu;
-          next.kg = stage_id;
-          next.task_streams = task_streams;
-          next.entry = work_entry;
-          VLOG(1) << "Scheduler new work " << pu << ":" << stage_id << ":";
-          buffer_queues.push_back(next);
-        }
-      }
+
+      gen_next_stage_tasks(pu, kg, num_post_col,
+        profiler, work_entry, task_streams, pipeline_stages,
+        stage.output_mapping, buffer_queue, post_input_queues); 
     }
 
     Intermediate work_togo;
-    while (!has_work_to_do(buffer_queues, pipeline_status, work_togo)) {
+    while (!has_work_to_do(buffer_queue, pipeline_status, work_togo)) {
       i32 pu = -1;
       std::tuple<std::deque<TaskStream>, EvalWorkEntry> input;
       if ((pu = wait_for_input(pre_output_queues, input)) == -1) {
@@ -179,35 +283,21 @@ void schedule(SchedulerArgs args) {
           i32 kg = finished.kg;
           EvalWorkEntry& work_entry = finished.entry;
           auto& task_streams = finished.task_streams;
+          OpStage &stage = pipeline_stages[kg];
+          pipeline_status[pu][kg] = false;
 
           //TODO: has_result
+          gen_next_stage_tasks(pu, kg, num_post_col, profiler,
+            work_entry, task_streams, pipeline_stages,
+            stage.output_mapping, buffer_queue, post_input_queues); 
 
-          pipeline_status[pu][kg] = false;
-          OpStage &stage = pipeline_stages[kg];
-          if (stage.is_last()) {
-            post_input_queues[pu].push(
-                std::make_tuple(task_streams, work_entry));
-          } else {
-            for (i32 stage_id: stage.children) {
-              Intermediate next;
-              next.pu = pu;
-              next.kg = stage_id;
-              next.task_streams = task_streams;
-              next.entry = work_entry;
-              VLOG(1) << "Scheduler new work " << pu << ":" << stage_id << ":";
-              buffer_queues.push_back(next);
-            }
-          }
         } else {
           std::this_thread::yield();
         }
       } else {
-        Intermediate next;
-        next.pu = pu;
-        next.kg = 0; // first kernal group after pre_eval
-        next.task_streams = std::get<0>(input);
-        next.entry = std::get<1>(input); 
-        buffer_queues.push_back(next);
+        gen_next_stage_tasks(pu, -1, num_post_col, profiler,
+          std::get<1>(input), std::get<0>(input), pipeline_stages,
+          input_col_mapping, buffer_queue, post_input_queues);
       }
     }
 
@@ -880,6 +970,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   }
 
   // Setup Scheduler and evaluate workers
+  Profiler scheduler_profiler(base_time);
   i32 pipeline_instances_per_node = job_params->pipeline_instances_per_node();
   i32 num_eval_threads = job_params->num_eval_threads();
   VLOG(1) << "Num worker threads: " << num_eval_threads;
@@ -891,31 +982,40 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   std::vector<OpStage> pipeline_stages;
   std::vector<std::vector<bool>> pipeline_status(
       pipeline_instances_per_node);
+  std::vector<std::vector<std::pair<i32, i32>>> input_col_mapping;
 
   SchedulerArgs sArgs(pre_output_queues,
                       post_input_queues,
+                      input_col_mapping,
                       result_queue,
                       task_queues,
                       pipeline_stages,
-                      pipeline_status);
+                      pipeline_status,
+                      scheduler_profiler);
   sArgs.num_eval_threads = num_eval_threads;
   sArgs.pipeline_instances_per_node = pipeline_instances_per_node;
+  sArgs.num_post_col = ops.back().inputs().size();
 
   // compute kernel group size first
+  std::map<i32, i32> op_stage_mapping;
   if (!kernel_factories.empty()) {
     i32 kg = 0;
     for (size_t i = 1; i < kernel_factories.size() - 1; ++i) {
       if (ops.at(i).name() == INPUT_OP_NAME)
         continue;
+      op_stage_mapping[i] = kg;
       pipeline_stages.emplace_back(kg++);
-      pipeline_stages.back().add_child(kg);
+      pipeline_stages.back().add_op(i);
     }
-    pipeline_stages.back().set_last();
   }
 
   // Analyze op DAG to determine what inputs need to be pipped along
   // and when intermediates can be retired -- essentially liveness analysis
-  perform_liveness_analysis(ops, analysis_results);
+  perform_liveness_analysis(ops,
+      analysis_results,
+      pipeline_stages,
+      op_stage_mapping,
+      input_col_mapping);
   // The live columns at each op index
   std::vector<std::vector<std::tuple<i32, std::string>>>& live_columns =
       analysis_results.live_columns;
@@ -937,6 +1037,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   if (!kernel_factories.empty()) {
     bool first_op = true;
     DeviceType last_device_type;
+    i32 kg = 0;
     for (size_t i = 1; i < kernel_factories.size() - 1; ++i) {
       KernelFactory* factory = kernel_factories[i];
       /*
@@ -950,7 +1051,6 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       auto& op_group = groups.back().op_names;
       auto& op_sampling = groups.back().sampling_args;
       auto& group = groups.back().kernel_factories;
-      auto& lc = groups.back().live_columns;
       auto& dc = groups.back().dead_columns;
       auto& uo = groups.back().unused_outputs;
       auto& cm = groups.back().column_mapping;
@@ -995,12 +1095,12 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
         assert(sampling_args_per_job.size() == jobs.size());
       }
       group.push_back(std::make_tuple(factory, kernel_configs[i]));
-      lc.push_back(live_columns[i]);
-      dc.push_back(dead_columns[i]);
-      uo.push_back(unused_outputs[i]);
-      cm.push_back(column_mapping[i]);
+      dc.push_back(dead_columns[kg]);
+      uo.push_back(unused_outputs[kg]);
+      cm.push_back(column_mapping[kg]);
       st.push_back(analysis_results.stencils[i]);
       bt.push_back(analysis_results.batch_sizes[i]);
+      kg++;
     }
   }
   VLOG(1) << "firebb: op" << ops.at(kernel_factories.size() - 1).name();
@@ -1130,7 +1230,6 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   i32 eval_total = 0;
 
   std::vector<Profiler> eval_thread_profilers;
-  Profiler scheduler_profiler(base_time);
   std::vector<Profiler> pre_eval_profilers;
   std::vector<Profiler> post_eval_profilers;
   // Set up eval_threads profilers
@@ -1162,8 +1261,6 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
 
       auto& group = groups[kg].kernel_factories;
       std::vector<EvaluateWorkerArgs>& thread_args = eval_args[ki];
-      std::vector<std::tuple<EvalQueue*, EvalQueue*>>& thread_qs =
-          eval_queues[ki];
       // HACK(apoms): we assume all ops in a kernel group use the
       //   same number of devices for now.
       KernelFactory* factory = nullptr;
@@ -1204,23 +1301,6 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
         first_kernel_type = std::get<1>(group[0]).devices[0];
       }
 
-      // Input work queue
-      EvalQueue* input_work_queue;
-      if (kg == 0) {
-        input_work_queue = &pre_output_queues[ki];
-      } else {
-        input_work_queue = &work_queues[kg];
-      }
-      // Create new queue for output, reuse previous queue as input
-      EvalQueue* output_work_queue;
-      if (kg == num_kernel_groups - 1) {
-        output_work_queue = &post_input_queues[ki];
-      } else {
-        output_work_queue = &work_queues[kg + 1];
-      }
-      // Create eval thread for passing data through neural net
-      thread_qs.push_back(
-          std::make_tuple(input_work_queue, output_work_queue));
       thread_args.emplace_back(EvaluateWorkerArgs{
           // Uniform arguments
           node_id_, startup_lock, startup_cv, startup_count,
