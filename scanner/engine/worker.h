@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include "scanner/engine/dag_analysis.h"
 #include "scanner/engine/metadata.h"
 #include "scanner/engine/rpc.grpc.pb.h"
 #include "scanner/engine/runtime.h"
@@ -27,26 +28,6 @@
 
 namespace scanner {
 namespace internal {
-
-class OpStage {
-  public:
-    OpStage(i32 kg, bool is_last)
-      : busy_(false),
-        kg_(kg),
-        is_last_(is_last) {}
-    bool is_last() {return is_last_;}
-    bool is_busy() {return busy_;}
-    void free() {busy_ = false;}
-    void occupy() {busy_ = true;}
-    i32 kg() {return kg_;}
-    void add_child(i32 kg) {children.push_back(kg);}
-    
-    std::vector<i32> children;
-  private:
-    bool busy_;
-    i32 kg_;
-    bool is_last_;
-};
 
 struct SchedulerArgs{
   // Num worker threads
@@ -61,19 +42,23 @@ struct SchedulerArgs{
   IntermediateQueue &result_queue;
   // Assign task Queues
   std::vector<IntermediateQueue> &task_queues;
-  // Pipeline status
-  std::vector<std::vector<OpStage>> &pipeline_status;
+  // Pipeline stages
+  std::vector<OpStage> &pipeline_stages;
+  // Pipeline status 
+  std::vector<std::vector<bool>> &pipeline_status;
 
   SchedulerArgs(std::vector<EvalQueue> &pre,
       std::vector<EvalQueue> &post,
       IntermediateQueue &result, 
       std::vector<IntermediateQueue> &task,
-      std::vector<std::vector<OpStage>> &pipeline)
+      std::vector<OpStage> &stages,
+      std::vector<std::vector<bool>> &status)
    : pre_output_queues(pre),
      post_input_queues(post),
      result_queue(result),
      task_queues(task),
-     pipeline_status(pipeline) {} 
+     pipeline_stages(stages), 
+     pipeline_status(status){} 
 };
 
 struct WorkerThreadArgs {
