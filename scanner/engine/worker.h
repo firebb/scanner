@@ -34,8 +34,12 @@ struct SchedulerArgs{
   i32 num_eval_threads;
   // Num instances
   i32 pipeline_instances_per_node;
+  // Num of columns to post eval 
+  i32 num_post_col;
   // PreEvaluator Queues
   std::vector<EvalQueue> &pre_output_queues;
+  // Input col -> [<next stage, input column index>]
+  std::vector<std::vector<std::pair<i32, i32>>> &input_col_mapping;
   // PostEvaluator Queues
   std::vector<EvalQueue> &post_input_queues;
   // Intermediate Queue
@@ -46,19 +50,25 @@ struct SchedulerArgs{
   std::vector<OpStage> &pipeline_stages;
   // Pipeline status 
   std::vector<std::vector<bool>> &pipeline_status;
+  // Profiler
+  Profiler &profiler;
 
   SchedulerArgs(std::vector<EvalQueue> &pre,
       std::vector<EvalQueue> &post,
+      std::vector<std::vector<std::pair<i32, i32>>> &mapping,
       IntermediateQueue &result, 
       std::vector<IntermediateQueue> &task,
       std::vector<OpStage> &stages,
-      std::vector<std::vector<bool>> &status)
+      std::vector<std::vector<bool>> &status,
+      Profiler &prof)
    : pre_output_queues(pre),
      post_input_queues(post),
+     input_col_mapping(mapping),
      result_queue(result),
      task_queues(task),
      pipeline_stages(stages), 
-     pipeline_status(status){} 
+     pipeline_status(status),
+     profiler(prof) {} 
 };
 
 struct WorkerThreadArgs {

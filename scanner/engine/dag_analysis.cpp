@@ -924,172 +924,6 @@ void remap_input_op_edges(std::vector<proto::Op>& ops,
     }
   }
 }
-void perform_liveness_analysis(const std::vector<proto::Op>& ops,
-                               DAGAnalysisInfo& results,
-                               std::vector<OpStage> &pipeline_stages) {
-  std::vector<std::vector<std::tuple<i32, std::string>>>& live_columns =
-      results.live_columns;
-  std::vector<std::vector<i32>>& dead_columns = results.dead_columns;
-  std::vector<std::vector<i32>>& unused_outputs = results.unused_outputs;
-  std::vector<std::vector<i32>>& column_mapping = results.column_mapping;
-
-  // Start off with the columns from the gathered tables
-  OpRegistry* op_registry = get_op_registry();
-  KernelRegistry* kernel_registry = get_kernel_registry();
-  // Active intermediates
-  std::map<i32, std::vector<std::tuple<std::string, i32>>> intermediates;
-  {
-    auto& input_op = ops.at(0);
-    for (const auto& col : input_op.inputs()) {
-      const std::string& input_col = col.column();
-      // Set last used to first op so that all input ops are live to start
-      // with. We could eliminate input columns which aren't used, but this
-      // also requires modifying the samples.
-      intermediates[0].push_back(std::make_tuple(input_col, 1));
-    }
-  }
-  for (size_t i = 1; i < ops.size(); ++i) {
-    auto& op = ops.at(i);
-    // For each input, update the intermediate last used index to the
-    // current index
-    for (auto& eval_input : op.inputs()) {
-      i32 parent_index = eval_input.op_index();
-      const std::string& parent_col = eval_input.column();
-      bool found = false;
-      for (auto& kv : intermediates.at(parent_index)) {
-        if (std::get<0>(kv) == parent_col) {
-          found = true;
-          std::get<1>(kv) = i;
-          break;
-        }
-      }
-      assert(found);
-    }
-    if (op.name() == OUTPUT_OP_NAME) {
-      continue;
-    }
-    // Add this op's outputs to the intermediate list
-    if (is_builtin_op(op.name())) {
-      // Make sure it is initialized even if no inputs
-      intermediates[i] = {};
-      for (auto& input : op.inputs()) {
-        std::string col = input.column();
-        // HACK(apoms): we remap input column names but don't update
-        // the downstream column. A better solution would be to
-        // explicitly enumerate the output column names during the initial
-        // dag analysis and keep it around.
-        if (ops.at(input.op_index()).name() == INPUT_OP_NAME) {
-          col = col.substr(col.find("_") + 1);
-        }
-        intermediates[i].push_back(std::make_tuple(col, i));
-      }
-    } else {
-      const auto& op_info = op_registry->get_op_info(op.name());
-      for (const auto& output_column : op_info->output_columns()) {
-        intermediates[i].push_back(std::make_tuple(output_column.name(), i));
-      }
-    }
-  }
-
-  // The live columns at each op index
-  live_columns.resize(ops.size());
-  for (size_t i = 0; i < ops.size(); ++i) {
-    i32 op_index = i;
-    auto& columns = live_columns[i];
-    size_t max_i = std::min((size_t)(ops.size() - 2), i);
-    for (size_t j = 0; j <= max_i; ++j) {
-      for (auto& kv : intermediates.at(j)) {
-        i32 last_used_index = std::get<1>(kv);
-        if (last_used_index > op_index) {
-          // Last used index is greater than current index, so still live
-          columns.push_back(std::make_tuple((i32)j, std::get<0>(kv)));
-        }
-      }
-    }
-  }
-
-  // The columns to remove for the current kernel
-  dead_columns.resize(ops.size());
-  // Outputs from the current kernel that are not used
-  unused_outputs.resize(ops.size());
-  // Indices in the live columns list that are the inputs to the current
-  // kernel.
-  column_mapping.resize(ops.size());
-  for (size_t i = 1; i < ops.size(); ++i) {
-    i32 op_index = i;
-    auto& prev_columns = live_columns[i - 1];
-    auto& op = ops.at(op_index);
-    // Determine which columns are no longer live
-    {
-      auto& unused = unused_outputs[i];
-      auto& dead = dead_columns[i];
-      // For all parent Ops, check if we are the last Op to use
-      // their output column
-      size_t max_i = std::min((size_t)(ops.size() - 2), (size_t)i);
-      for (size_t j = 0; j <= max_i; ++j) {
-        i32 parent_index = j;
-        // For the current parent Op, check if we are the last to use
-        // any of its outputs
-        for (auto& kv : intermediates.at(j)) {
-          i32 last_used_index = std::get<1>(kv);
-          if (last_used_index == op_index) {
-            // We are the last to use the Op column.
-            // Column is no longer live, so remove it.
-            const std::string& col_name = std::get<0>(kv);
-            if (j == i) {
-              // This column was produced by the current Op but not used
-              i32 col_index = -1;
-              const std::vector<Column>& op_cols =
-                  op_registry->get_op_info(op.name())->output_columns();
-              for (size_t k = 0; k < op_cols.size(); k++) {
-                if (col_name == op_cols[k].name()) {
-                  col_index = k;
-                  break;
-                }
-              }
-              assert(col_index != -1);
-              unused.push_back(col_index);
-            } else {
-              // This column was produced by a previous Op
-              // Determine where in the previous live columns list this
-              // column existed
-              i32 col_index = -1;
-              for (i32 k = 0; k < (i32)prev_columns.size(); ++k) {
-                const std::tuple<i32, std::string>& live_input =
-                    prev_columns[k];
-                if (parent_index == std::get<0>(live_input) &&
-                    col_name == std::get<1>(live_input)) {
-                  col_index = k;
-                  break;
-                }
-              }
-              assert(col_index != -1);
-              dead.push_back(col_index);
-            }
-          }
-        }
-      }
-    }
-    // For each input to the Op, determine where in the live column list
-    // that input is
-    auto& mapping = column_mapping.at(op_index);
-    for (const auto& eval_input : op.inputs()) {
-      i32 parent_index = eval_input.op_index();
-      const std::string& col = eval_input.column();
-      i32 col_index = -1;
-      for (i32 k = 0; k < (i32)prev_columns.size(); ++k) {
-        const std::tuple<i32, std::string>& live_input = prev_columns[k];
-        if (parent_index == std::get<0>(live_input) &&
-            col == std::get<1>(live_input)) {
-          col_index = k;
-          break;
-        }
-      }
-      assert(col_index != -1);
-      mapping.push_back(col_index);
-    }
-  }
-}
 
 void perform_liveness_analysis(const std::vector<proto::Op>& ops,
                                DAGAnalysisInfo& results) {
@@ -1259,6 +1093,154 @@ void perform_liveness_analysis(const std::vector<proto::Op>& ops,
       }
       assert(col_index != -1);
       mapping.push_back(col_index);
+    }
+  }
+}
+
+void perform_liveness_analysis(const std::vector<proto::Op>& ops,
+    DAGAnalysisInfo& results,
+    std::vector<OpStage> &pipeline_stages,
+    std::map<i32, i32> &op_stage_mapping,
+    std::vector<std::vector<std::pair<i32, i32>>> &input_col_mapping) {
+  std::vector<std::vector<i32>>& dead_columns = results.dead_columns;
+  std::vector<std::vector<i32>>& unused_outputs = results.unused_outputs;
+  std::vector<std::vector<i32>>& column_mapping = results.column_mapping;
+
+  // Start off with the columns from the gathered tables
+  OpRegistry* op_registry = get_op_registry();
+
+  auto& input_op = ops.at(0);
+  input_col_mapping.resize(input_op.inputs().size());
+
+  // Since each stage only contains one op, all inputs would be regarded
+  // as dead columns. Unused output could be found as there would be no
+  // next stage. Column_mapping would be exactly the same order as the
+  // inputs.
+  dead_columns.resize(pipeline_stages.size());
+  unused_outputs.resize(pipeline_stages.size());
+  column_mapping.resize(pipeline_stages.size());
+  for (i32 kg = 0; kg < pipeline_stages.size(); kg++) {
+    auto &stage = pipeline_stages.at(kg);
+    // HACK only one op per stage
+    auto &op = ops.at(stage.ops[0]);
+    const auto& op_info = op_registry->get_op_info(op.name());
+    stage.output_mapping.resize(op_info->output_columns().size());
+
+    // Set number of inputs
+    stage.set_inputs(op.inputs().size());
+
+    // Add dead columns and column mapping
+    for (i32 col = 0; col < op.inputs().size(); col++) {
+      dead_columns[kg].push_back(col);
+      column_mapping[kg].push_back(col);
+    }
+
+    // Add output column mapping for parent
+    for (i32 col = 0; col < op.inputs().size(); col++) {
+      auto& input = op.inputs()[col];
+      std::string col_name = input.column();
+      i32 pidx = input.op_index();
+      bool found = false;
+      if (pidx == 0) {
+        // handle inputs of the pipeline
+        for (i32 i = 0; i < input_op.inputs().size(); i++) {
+          if (col_name == input_op.inputs()[i].column()) {
+            input_col_mapping[i].push_back(std::make_pair(kg, col));
+            found = true;
+            break;
+          }
+        }
+      } else {
+        auto& parent_stage = pipeline_stages[op_stage_mapping[pidx]];
+        auto& parent_op = ops.at(pidx);
+        i32 cidx = 0;
+        if (is_builtin_op(parent_op.name())) {
+          for (auto& in : parent_op.inputs()) {
+            if (col_name == in.column()) {
+              parent_stage.output_mapping[cidx].push_back(
+                  std::make_pair(kg, col)); 
+              parent_stage.add_child(kg);
+              found = true;
+              break;
+            }
+            cidx ++;
+          }
+        } else {
+          const auto& info = op_registry->get_op_info(parent_op.name());
+          for (const auto& output_column : info->output_columns()) {
+            if (col_name == output_column.name()) {
+              parent_stage.output_mapping[cidx].push_back(
+                  std::make_pair(kg, col)); 
+              parent_stage.add_child(kg);
+              found = true;
+              break;
+            }
+            cidx ++;
+          }
+        }
+      }
+      assert(found);
+    }
+  }
+
+  // TODO: handle unused column output
+
+  // column mapping is required for post_evaluator
+  {
+    // Add output mapping for parent stages of the output
+    auto& out_op = ops.back();
+    i32 col = 0;
+    for (auto& input: out_op.inputs()) {
+      i32 pidx = input.op_index();
+      std::string col_name = input.column();
+      bool found = false;
+      if (pidx == 0) {
+        // handle inputs of the pipeline
+        for (i32 i = 0; i < input_op.inputs().size(); i++) {
+          if (col_name == input_op.inputs()[i].column()) {
+            input_col_mapping[i].push_back(std::make_pair(-1, col));
+            found = true;
+            break;
+          }
+        }
+      } else {
+        auto& parent_stage = pipeline_stages[op_stage_mapping[pidx]];
+        auto& parent_op = ops.at(pidx);
+        i32 cidx = 0;
+        if (is_builtin_op(parent_op.name())) {
+          for (auto& in : parent_op.inputs()) {
+            if (col_name == in.column()) {
+              parent_stage.output_mapping[cidx].push_back(
+                  std::make_pair(-1, col)); 
+              parent_stage.add_child(-1);
+              found = true;
+              break;
+            }
+            cidx ++;
+          }
+        } else {
+          const auto& info = op_registry->get_op_info(parent_op.name());
+          for (const auto& output_column : info->output_columns()) {
+            if (col_name == output_column.name()) {
+              parent_stage.output_mapping[cidx].push_back(
+                  std::make_pair(-1, col)); 
+              parent_stage.add_child(-1);
+              found = true;
+              break;
+            }
+            cidx ++;
+          }
+        }
+      }
+      assert(found);
+      col++;
+    }
+
+    column_mapping.emplace_back();
+    auto &cidxs = column_mapping.back();
+    // Output should be in the same order as defined.
+    for (i32 col = 0; col < ops.back().inputs().size(); col++) {
+      cidxs.push_back(col);
     }
   }
 }
