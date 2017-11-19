@@ -21,7 +21,6 @@
 #include "scanner/engine/save_worker.h"
 #include "scanner/engine/table_meta_cache.h"
 #include "scanner/engine/python_kernel.h"
-#include "scanner/engine/dag_analysis.h"
 #include "scanner/util/cuda.h"
 #include "scanner/util/glog.h"
 
@@ -71,7 +70,7 @@ i32 wait_for_input(std::vector<EvalQueue> &pre_output_queues,
 
 bool has_work_to_do(
     std::deque<Intermediate> &buffer_queues,
-    std::vector<std::vector<OpStage>> &pipeline_status,
+    std::vector<std::vector<bool>> &pipeline_status,
     Intermediate &work_togo) {
   i32 buffered_works = buffer_queues.size();
   if (buffered_works == 0) return false;
@@ -81,7 +80,7 @@ bool has_work_to_do(
     buffer_queues.pop_front();
     i32 pu = inter.pu;
     i32 kg = inter.kg;
-    if (!pipeline_status[pu][kg].is_busy()) {
+    if (!pipeline_status[pu][kg]) {
       work_togo = inter;
       // Restore the task order
       i++;
@@ -108,7 +107,8 @@ void schedule(SchedulerArgs args) {
   std::vector<EvalQueue> &post_input_queues = args.post_input_queues;
   IntermediateQueue &result_queue = args.result_queue;
   std::vector<IntermediateQueue> &task_queues = args.task_queues;
-  std::vector<std::vector<OpStage>> &pipeline_status = args.pipeline_status;
+  std::vector<OpStage> &pipeline_stages = args.pipeline_stages;
+  std::vector<std::vector<bool>> &pipeline_status = args.pipeline_status;
   std::deque<Intermediate> buffer_queues;
 
   for (i32 wid = 0; wid < num_eval_threads; wid++) {
@@ -138,8 +138,8 @@ void schedule(SchedulerArgs args) {
 
       //TODO: has_result
 
-      OpStage &stage = pipeline_status[pu][kg];
-      stage.free();
+      OpStage &stage = pipeline_stages[kg];
+      pipeline_status[pu][kg] = false;
       if (stage.is_last()) {
         VLOG(1) << "Scheduler worker " << finished.wid <<
           " push result to post eval";
@@ -182,8 +182,8 @@ void schedule(SchedulerArgs args) {
 
           //TODO: has_result
 
-          OpStage &stage = pipeline_status[pu][kg];
-          stage.free();
+          pipeline_status[pu][kg] = false;
+          OpStage &stage = pipeline_stages[kg];
           if (stage.is_last()) {
             post_input_queues[pu].push(
                 std::make_tuple(task_streams, work_entry));
@@ -220,7 +220,7 @@ void schedule(SchedulerArgs args) {
     free_workers.pop_front();
 
     task_queues[wid].push(work_togo);
-    pipeline_status[work_togo.pu][work_togo.kg].occupy();
+    pipeline_status[work_togo.pu][work_togo.kg] = true;
   }
 }
 
@@ -777,22 +777,6 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   // Need slice input rows to know which slice we are in
   determine_input_rows_to_slices(meta, table_meta, jobs, ops, analysis_results);
   remap_input_op_edges(ops, analysis_results);
-  // Analyze op DAG to determine what inputs need to be pipped along
-  // and when intermediates can be retired -- essentially liveness analysis
-  perform_liveness_analysis(ops, analysis_results);
-  // The live columns at each op index
-  std::vector<std::vector<std::tuple<i32, std::string>>>& live_columns =
-      analysis_results.live_columns;
-  // The columns to remove for the current kernel
-  std::vector<std::vector<i32>> dead_columns =
-      analysis_results.dead_columns;
-  // Outputs from the current kernel that are not used
-  std::vector<std::vector<i32>> unused_outputs =
-      analysis_results.unused_outputs;
-  // Indices in the live columns list that are the inputs to the current
-  // kernel. Starts from the second evalutor (index 1)
-  std::vector<std::vector<i32>> column_mapping =
-      analysis_results.column_mapping;
 
   // Read final output columns for use in post-evaluate worker
   // (needed for determining column types)
@@ -893,6 +877,58 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     kernel_configs.push_back(kernel_config);
   }
 
+  // Setup Scheduler and evaluate workers
+  i32 pipeline_instances_per_node = job_params->pipeline_instances_per_node();
+  i32 num_eval_threads = job_params->num_eval_threads();
+  VLOG(1) << "Num worker threads: " << num_eval_threads;
+
+  std::vector<EvalQueue> post_input_queues(pipeline_instances_per_node);
+  std::vector<EvalQueue> pre_output_queues(pipeline_instances_per_node);
+  IntermediateQueue result_queue;
+  std::vector<IntermediateQueue> task_queues(num_eval_threads);
+  std::vector<OpStage> pipeline_stages;
+  std::vector<std::vector<bool>> pipeline_status(
+      pipeline_instances_per_node);
+
+  SchedulerArgs sArgs(pre_output_queues,
+                      post_input_queues,
+                      result_queue,
+                      task_queues,
+                      pipeline_stages,
+                      pipeline_status);
+  sArgs.num_eval_threads = num_eval_threads;
+  sArgs.pipeline_instances_per_node = pipeline_instances_per_node;
+
+  // compute kernel group size first
+  if (!kernel_factories.empty()) {
+    i32 kg = 0;
+    for (size_t i = 1; i < kernel_factories.size() - 1; ++i) {
+      if (ops.at(i).name() == INPUT_OP_NAME)
+        continue;
+      pipeline_stages.emplace_back(kg++);
+      pipeline_stages.back().add_child(kg);
+    }
+    pipeline_stages.back().set_last();
+  }
+
+  // Analyze op DAG to determine what inputs need to be pipped along
+  // and when intermediates can be retired -- essentially liveness analysis
+  perform_liveness_analysis(ops, analysis_results);
+  // The live columns at each op index
+  std::vector<std::vector<std::tuple<i32, std::string>>>& live_columns =
+      analysis_results.live_columns;
+  // The columns to remove for the current kernel
+  std::vector<std::vector<i32>> dead_columns =
+      analysis_results.dead_columns;
+  // Outputs from the current kernel that are not used
+  std::vector<std::vector<i32>> unused_outputs =
+      analysis_results.unused_outputs;
+  // Indices in the live columns list that are the inputs to the current
+  // kernel. Starts from the second evalutor (index 1)
+  std::vector<std::vector<i32>> column_mapping =
+      analysis_results.column_mapping;
+
+
   VLOG(1) << "firebb: op" << ops.at(0).name();
   // Break up kernels into groups that run on the same device
   std::vector<OpArgGroup> groups;
@@ -971,7 +1007,6 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   VLOG(1) << "firebb num of kernel groups: " << num_kernel_groups;
   assert(num_kernel_groups > 0);  // is this actually necessary?
 
-  i32 pipeline_instances_per_node = job_params->pipeline_instances_per_node();
   // If ki per node is -1, we set a smart default. Currently, we calculate the
   // maximum possible kernel instances without oversubscribing any part of the
   // pipeline, either CPU or GPU.
@@ -1068,25 +1103,6 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
                               std::ref(initial_eval_work), args);
   }
 
-  // Setup Scheduler and evaluate workers
-  i32 num_eval_threads = job_params->num_eval_threads();
-  VLOG(1) << "Num worker threads: " << num_eval_threads;
-
-  std::vector<EvalQueue> post_input_queues(pipeline_instances_per_node);
-  std::vector<EvalQueue> pre_output_queues(pipeline_instances_per_node);
-  IntermediateQueue result_queue;
-  std::vector<IntermediateQueue> task_queues(num_eval_threads);
-  std::vector<std::vector<OpStage>> pipeline_status(
-      pipeline_instances_per_node);
-
-  SchedulerArgs sArgs(pre_output_queues,
-                      post_input_queues,
-                      result_queue,
-                      task_queues,
-                      pipeline_status);
-  sArgs.num_eval_threads = num_eval_threads;
-  sArgs.pipeline_instances_per_node = pipeline_instances_per_node;
-
   // Set up all other queues
   std::vector<std::vector<proto::Result>> eval_results(
       pipeline_instances_per_node);
@@ -1101,7 +1117,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   std::vector<PostEvaluateWorkerArgs> post_eval_args;
 
   // For worker threads
-  std::vector<std::vector<EvaluateWorker *>> pipeline_stages(
+  std::vector<std::vector<EvaluateWorker *>> pipeline_eval_workers(
       pipeline_instances_per_node);
 
   i32 next_cpu_num = 0;
@@ -1120,20 +1136,8 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     eval_thread_profilers.push_back(Profiler(base_time));
   }
 
-  // Set up the pipeline status
-  for (i32 pu = 0; pu < pipeline_instances_per_node; ++pu) {
-    auto& status = pipeline_status[pu];
-
-    for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
-      status.emplace_back(kg, kg == num_kernel_groups - 1);
-      // Hack to schedule the linear pipeline since the DAG is
-      // topologically sorted.
-      if (kg != num_kernel_groups - 1) {
-        status.at(kg).add_child(kg + 1);
-      }
-    }
-
-    // Set up pipeline pre post profiler
+  // Set up pipeline pre post profiler
+  for (i32 pu = 0; pu < pipeline_instances_per_node; pu ++) {
     pre_eval_profilers.push_back(Profiler(base_time));
     post_eval_profilers.push_back(Profiler(base_time));
   }
@@ -1151,6 +1155,9 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     // Evaluate worker
     DeviceHandle first_kernel_type;
     for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
+      // All stages are free in the beginning
+      pipeline_status[ki].push_back(false);
+
       auto& group = groups[kg].kernel_factories;
       std::vector<EvaluateWorkerArgs>& thread_args = eval_args[ki];
       std::vector<std::tuple<EvalQueue*, EvalQueue*>>& thread_qs =
@@ -1285,13 +1292,13 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     // Op threads
     //eval_threads.emplace_back();
     //std::vector<std::thread>& threads = eval_threads.back();
-    std::vector<EvaluateWorker *>& stages = pipeline_stages[pu];
+    std::vector<EvaluateWorker *>& workers = pipeline_eval_workers[pu];
     for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
       //threads.emplace_back(
       //    evaluate_driver, std::ref(*std::get<0>(eval_queues[pu][kg])),
       //    std::ref(*std::get<1>(eval_queues[pu][kg])), eval_args[pu][kg]);
       EvaluateWorkerArgs& args = std::ref(eval_args[pu][kg]);
-      stages.push_back(new EvaluateWorker(args));
+      workers.push_back(new EvaluateWorker(args));
     }
     // Post threads
     post_eval_threads.emplace_back(
@@ -1305,7 +1312,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     eval_threads.emplace_back(worker_thread,
         std::ref(task_queues[wid]),
         std::ref(result_queue),
-        std::ref(pipeline_stages),
+        std::ref(pipeline_eval_workers),
         std::ref(eval_args),
         std::ref(eval_thread_profilers[wid]),
         wid);

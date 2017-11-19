@@ -40,6 +40,26 @@ const std::vector<std::string> BUILTIN_OP_NAMES = {
 
 bool is_builtin_op(const std::string& name);
 
+class OpStage {
+  public:
+    OpStage(i32 kg)
+      : kg_(kg){}
+    void set_last() {is_last_=true;};
+    bool is_last() {return is_last_;}
+    i32 kg() {return kg_;}
+    void add_child(i32 kg) {children.push_back(kg);}
+    
+    // OP indexes in the stage. TODO: one stage may contains multiple ops.
+    std::vector<i32> ops;
+    // Next stage indexes
+    std::vector<i32> children;
+    // Output column index -> [<next stage, input column index>]
+    std::vector<std::vector<std::pair<i32, i32>>> output_mapping;
+  private:
+    bool is_last_ = false;
+    i32 kg_;
+};
+
 struct DAGAnalysisInfo {
   std::vector<i32> op_slice_level;
   std::map<i64, i64> input_ops;
@@ -108,6 +128,10 @@ void remap_input_op_edges(std::vector<proto::Op>& ops,
 
 void perform_liveness_analysis(const std::vector<proto::Op>& ops,
                                DAGAnalysisInfo& info);
+
+void perform_liveness_analysis(const std::vector<proto::Op>& ops,
+                               DAGAnalysisInfo& info,
+                               std::vector<OpStage> &pipeline_stages);
 
 Result derive_stencil_requirements(
     const DatabaseMetadata& meta, const TableMetaCache& table_meta,
