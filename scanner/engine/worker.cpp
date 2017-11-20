@@ -99,14 +99,18 @@ bool has_work_to_do(
   return false;
 }
 
-void gen_next_stage_tasks(i32 pu, i32 kg, i32 num_post_col,
-    Profiler &profiler,
-    EvalWorkEntry& work_entry,
-    std::deque<TaskStream>& task_streams,
-    std::vector<OpStage> &pipeline_stages,
+void gen_next_stage_tasks(i32 pu, i32 kg,
     std::vector<std::vector<std::pair<i32, i32>>> &col_mapping,
-    std::deque<Intermediate>& buffer_queue,
-    std::vector<EvalQueue> &post_input_queues) {
+    std::deque<Intermediate> &buffer_queue,
+    EvalWorkEntry &work_entry,
+    std::deque<TaskStream> &task_streams,
+    SchedulerArgs &sArgs) {
+  i32 num_post_col = sArgs.num_post_col;
+  i32 num_ops = sArgs.num_ops; 
+  Profiler &profiler = sArgs.profiler;
+  std::vector<OpStage> &pipeline_stages = sArgs.pipeline_stages;
+  std::vector<EvalQueue> &post_input_queues = sArgs.post_input_queues;
+
   std::set<i32> next_stages;
   if (kg == -1) {
     // kg == -1 indicates input from pre_eval
@@ -186,6 +190,11 @@ void gen_next_stage_tasks(i32 pu, i32 kg, i32 num_post_col,
 
     if (stage_id == -1) {
       VLOG(1) << "Scheduler push result to post eval ";
+      if (task_streams.size() > 0) {
+        for (i32 i = 0; i < num_ops; i++) {
+          task_streams.pop_front();
+        }
+      }
       post_input_queues[pu].push(
           std::make_tuple(task_streams, new_entry));
     } else {
@@ -257,9 +266,8 @@ void schedule(SchedulerArgs args) {
       OpStage &stage = pipeline_stages[kg];
       pipeline_status[pu][kg] = false;
 
-      gen_next_stage_tasks(pu, kg, num_post_col,
-        profiler, work_entry, task_streams, pipeline_stages,
-        stage.output_mapping, buffer_queue, post_input_queues); 
+      gen_next_stage_tasks(pu, kg, stage.output_mapping,
+        buffer_queue, work_entry, task_streams, args); 
     }
 
     Intermediate work_togo;
@@ -287,17 +295,15 @@ void schedule(SchedulerArgs args) {
           pipeline_status[pu][kg] = false;
 
           //TODO: has_result
-          gen_next_stage_tasks(pu, kg, num_post_col, profiler,
-            work_entry, task_streams, pipeline_stages,
-            stage.output_mapping, buffer_queue, post_input_queues); 
+          gen_next_stage_tasks(pu, kg, stage.output_mapping,
+            buffer_queue, work_entry, task_streams, args); 
 
         } else {
           std::this_thread::yield();
         }
       } else {
-        gen_next_stage_tasks(pu, -1, num_post_col, profiler,
-          std::get<1>(input), std::get<0>(input), pipeline_stages,
-          input_col_mapping, buffer_queue, post_input_queues);
+        gen_next_stage_tasks(pu, -1, input_col_mapping,
+          buffer_queue, std::get<1>(input), std::get<0>(input), args); 
       }
     }
 
@@ -349,9 +355,10 @@ void worker_thread(IntermediateQueue &task_queue,
       for (i32 i = 0;
           i < eval_args[pu][kg].arg_group.kernel_factories.size();
           ++i) {
-        assert(!task_streams.empty());
-        streams.push_back(task_streams.front());
-        task_streams.pop_front();
+        assert(eval_args[pu][kg].arg_group.task_streams_start + i < 
+               task_streams.size());
+        streams.push_back(task_streams.at(
+              eval_args[pu][kg].arg_group.task_streams_start + i));
       }
       worker.new_task(work_entry.job_index, work_entry.task_index, streams);
     }
@@ -1036,6 +1043,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     bool first_op = true;
     DeviceType last_device_type;
     i32 kg = 0;
+    i32 op_counter = 0; 
     for (size_t i = 1; i < kernel_factories.size() - 1; ++i) {
       KernelFactory* factory = kernel_factories[i];
       /*
@@ -1098,8 +1106,10 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       cm.push_back(column_mapping[kg]);
       st.push_back(analysis_results.stencils[i]);
       bt.push_back(analysis_results.batch_sizes[i]);
+      groups.back().task_streams_start = op_counter;
       kg++;
     }
+    sArgs.num_ops = op_counter;
   }
   VLOG(1) << "firebb: op" << ops.at(kernel_factories.size() - 1).name();
 

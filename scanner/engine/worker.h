@@ -36,6 +36,8 @@ struct SchedulerArgs{
   i32 pipeline_instances_per_node;
   // Num of columns to post eval 
   i32 num_post_col;
+  // Num of ops in evaluate stages
+  i32 num_ops; 
   // PreEvaluator Queues
   std::vector<EvalQueue> &pre_output_queues;
   // Input col -> [<next stage, input column index>]

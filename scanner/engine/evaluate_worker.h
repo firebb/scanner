@@ -101,6 +101,8 @@ struct OpArgGroup {
   std::vector<std::vector<i32>> kernel_stencils;
   // Batch size needed by kernels
   std::vector<i32> kernel_batch_sizes;
+  // Start index of the TaskStream Argument
+  i32 task_streams_start;
 };
 
 struct EvaluateWorkerArgs {
