@@ -234,6 +234,8 @@ class PostEvaluateWorker {
 
   // Generator state
   EvalWorkEntry buffered_entry_;
+  // Whether each column received the last io packet
+  std::vector<bool> last_in_io_packet_;
   i64 current_offset_;
   std::deque<EvalWorkEntry> buffered_entries_;
 };

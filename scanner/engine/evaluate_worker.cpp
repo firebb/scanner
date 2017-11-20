@@ -930,6 +930,9 @@ PostEvaluateWorker::PostEvaluateWorker(const PostEvaluateWorkerArgs& args)
   // Setup video encoders
   // TODO(apoms): Make this dynamic based on the encoded column type
   for (size_t i = 0; i < args.columns.size(); ++i) {
+    // Set default as false
+    last_in_io_packet_.push_back(false);
+
     auto& col = args.columns[i];
     auto& compression_opts = args.column_compression[i];
     ColumnType type = col.type();
@@ -946,6 +949,7 @@ PostEvaluateWorker::PostEvaluateWorker(const PostEvaluateWorkerArgs& args)
           std::atoi(compression_opts.options.at("keyframe_distance").c_str());
     }
     encode_options_.push_back(opts);
+
   }
   for (auto& compression_opts : args.column_compression) {
     auto& codec = compression_opts.codec;
@@ -962,9 +966,8 @@ PostEvaluateWorker::PostEvaluateWorker(const PostEvaluateWorkerArgs& args)
 void PostEvaluateWorker::feed(EvalWorkEntry& entry) {
   EvalWorkEntry& work_entry = entry;
 
-  // HACK(apoms): this will fail horrible and leak memory if
-  // we receive outputs at different rates.
-  if (entry.columns.empty() || entry.columns[0].empty()) {
+  // Allow outputs coming at different rates and store them in the buffer
+  if (entry.columns.empty()) {
     return;
   }
 
@@ -985,16 +988,36 @@ void PostEvaluateWorker::feed(EvalWorkEntry& entry) {
       i32 col_idx = column_mapping_[i];
       buffered_entry_.column_types.push_back(columns_[i].type());
       buffered_entry_.column_handles.push_back(CPU_DEVICE);
-      if (columns_[i].type() == ColumnType::Video) {
-        assert(work_entry.columns[col_idx].size() > 0);
-        Frame* frame = work_entry.columns[col_idx][0].as_frame();
-        buffered_entry_.frame_sizes.push_back(frame->as_frame_info());
-      }
+      buffered_entry_.frame_sizes.emplace_back();
       buffered_entry_.compressed.push_back(compression_enabled_[i]);
     }
     if (work_entry.needs_configure) {
       for (size_t i = 0; i < encoder_configured_.size(); ++i) {
         encoder_configured_[i] = false;
+      }
+    }
+  }
+
+  assert(buffered_entry_.table_id == work_entry.table_id);
+  assert(buffered_entry_.job_index == work_entry.job_index);
+  assert(buffered_entry_.task_index == work_entry.task_index);
+
+  for (size_t i = 0; i < columns_.size(); ++i) {
+    i32 col_idx = column_mapping_[i];
+    // Initialize the frame size if the columns is seen for the first time.
+    if (work_entry.columns[col_idx].size() != 0 &&
+        columns_[i].type() == ColumnType::Video &&
+        buffered_entry_.columns[i].size() == 0) {
+      Frame* frame = work_entry.columns[col_idx][0].as_frame();
+      buffered_entry_.frame_sizes[i] = frame->as_frame_info();
+    }
+  }
+
+  if (work_entry.last_in_io_packet) {
+    for (size_t i = 0; i < columns_.size(); ++i) {
+      i32 col_idx = column_mapping_[i];
+      if (work_entry.columns[col_idx].size() != 0) {
+        last_in_io_packet_[i] = true;
       }
     }
   }
@@ -1006,17 +1029,18 @@ void PostEvaluateWorker::feed(EvalWorkEntry& entry) {
   // Swizzle columns correctly
   for (size_t i = 0; i < column_mapping_.size(); ++i) {
     i32 col_idx = column_mapping_[i];
+    // Skip empty columns
+    if (work_entry.columns[col_idx].size() == 0) continue;
     ColumnType column_type = columns_[i].type();
     // Encode video frames
     if (compression_enabled_[i] && column_type == ColumnType::Video &&
-        buffered_entry_.frame_sizes[encoder_idx].type == FrameType::U8) {
+        buffered_entry_.frame_sizes[i].type == FrameType::U8) {
       auto& encoder = encoders_[encoder_idx];
       if (!encoder_configured_[encoder_idx]) {
         // Configure encoder
         encoder_configured_[encoder_idx] = true;
         Frame* frame = work_entry.columns[col_idx][0].as_frame();
         encoder->configure(frame->as_frame_info(),
-
                            encode_options_[encoder_idx]);
       }
 
@@ -1059,6 +1083,7 @@ void PostEvaluateWorker::feed(EvalWorkEntry& entry) {
           work_entry.row_ids[col_idx].end());
     }
   }
+
   // Delete unused columns
   for (size_t i = 0; i < work_entry.columns.size(); ++i) {
     if (column_set_.count(i) > 0) {
@@ -1073,11 +1098,18 @@ void PostEvaluateWorker::feed(EvalWorkEntry& entry) {
 
   // Flush row buffer
   if (work_entry.last_in_io_packet) {
+    // Check if all columns in the io_packet have been received
+    for (size_t i = 0; i < column_mapping_.size() - 1; ++i) {
+      if (!last_in_io_packet_[i]) {
+        return;
+      }
+    }
+
     // Flush video encoder and get rest of packets
     for (size_t i = 0; i < column_mapping_.size(); ++i) {
       ColumnType column_type = columns_[i].type();
       if (compression_enabled_[i] && column_type == ColumnType::Video &&
-          buffered_entry_.frame_sizes[encoder_idx].type == FrameType::U8) {
+          buffered_entry_.frame_sizes[i].type == FrameType::U8) {
         auto& encoder = encoders_[encoder_idx];
 
         // Get last packets in encoder
@@ -1105,6 +1137,9 @@ void PostEvaluateWorker::feed(EvalWorkEntry& entry) {
       buffered_entries_.push_back(buffered_entry_);
       buffered_entry_.columns.clear();
       buffered_entry_.row_ids.clear();
+      for (size_t i = 0; i < columns_.size(); ++i) {
+        last_in_io_packet_[i] = false;
+      }
     }
   }
 }
