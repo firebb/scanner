@@ -184,6 +184,9 @@ EvaluateWorker::EvaluateWorker(const EvaluateWorkerArgs& args)
     worker_id_(worker_id_),
     profiler_(args.profiler),
     arg_group_(args.arg_group) {
+  job_idx_ = -1;
+  task_idx_ = -1;
+
   auto setup_start = now();
   for (auto& col : arg_group_.column_mapping) {
     column_mapping_set_.emplace_back(col.begin(), col.end());
@@ -467,8 +470,12 @@ void EvaluateWorker::feed(EvalWorkEntry& work_entry, Profiler& profiler) {
     if (input_column_idx.size() > 0 && kernel_cache_row_ids[0].size() > 0) {
       max_row_id_seen = kernel_cache_row_ids[0].back();
       for (i32 i = 1; i < input_column_idx.size(); ++i) {
-        max_row_id_seen =
-            std::min(max_row_id_seen, kernel_cache_row_ids[i].back());
+        if (kernel_cache_row_ids[i].size() > 0) {
+          max_row_id_seen =
+              std::min(max_row_id_seen, kernel_cache_row_ids[i].back());
+        } else {
+          max_row_id_seen = -1;
+        }
       }
       // Update current compute position
       for (i64 i = 0; i < kernel_cache_row_ids[0].size(); ++i) {
@@ -1099,7 +1106,7 @@ void PostEvaluateWorker::feed(EvalWorkEntry& entry) {
   // Flush row buffer
   if (work_entry.last_in_io_packet) {
     // Check if all columns in the io_packet have been received
-    for (size_t i = 0; i < column_mapping_.size() - 1; ++i) {
+    for (size_t i = 0; i < column_mapping_.size(); ++i) {
       if (!last_in_io_packet_[i]) {
         return;
       }

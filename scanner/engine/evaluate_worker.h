@@ -133,6 +133,9 @@ class EvaluateWorker {
 
   bool yield(i32 item_size, EvalWorkEntry& output, Profiler& profiler);
 
+  i64 job_idx() {return job_idx_;};
+  i64 task_idx() {return task_idx_;};
+
  private:
   void clear_stencil_cache();
 

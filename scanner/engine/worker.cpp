@@ -158,12 +158,10 @@ void gen_next_stage_tasks(i32 pu, i32 kg,
 
     for (i32 col = 0; col < col_mapping.size(); col++) {
       auto& mapping = col_mapping[col];
-      bool found = false;
       for (auto& map : mapping) {
         if (std::get<0>(map) == stage_id) {
           i32 to_col = std::get<1>(map);
           DeviceHandle handle = work_entry.column_handles[col];
-          //new_entry.columns[to_col]
           if (need_copy[col]) {
             ElementList list = 
               copy_or_ref_elements(profiler, handle,
@@ -181,11 +179,9 @@ void gen_next_stage_tasks(i32 pu, i32 kg,
                                            output_row_ids[col].begin(),
                                            output_row_ids[col].end());
           new_entry.column_handles[to_col] = handle;
-          found = true;
           break;
-        }  
+        }
       }
-      assert(found);
     }
 
     if (stage_id == -1) {
@@ -349,7 +345,9 @@ void worker_thread(IntermediateQueue &task_queue,
     auto work_start = now();
     EvaluateWorker &worker = std::ref(*pipeline_stages.at(pu).at(kg)); 
 
-    if (task_streams.size() > 0) {
+    if (task_streams.size() > 0 &&
+        (worker.job_idx() != work_entry.job_index ||
+         worker.task_idx() != work_entry.task_index)) {
       // Start of a new task. Tell kernels what outputs they should produce.
       std::vector<TaskStream> streams;
       for (i32 i = 0;
