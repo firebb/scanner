@@ -71,7 +71,7 @@ i32 wait_for_input(std::vector<EvalQueue> &pre_output_queues,
 
 bool has_work_to_do(
     std::deque<Intermediate> &buffer_queue,
-    std::vector<std::vector<bool>> &pipeline_status,
+    std::vector<std::vector<std::tuple<bool,bool,i32,i32>>> &pipeline_status,
     Intermediate &work_togo) {
   i32 buffered_works = buffer_queue.size();
   if (buffered_works == 0) return false;
@@ -81,8 +81,15 @@ bool has_work_to_do(
     buffer_queue.pop_front();
     i32 pu = inter.pu;
     i32 kg = inter.kg;
-    if (!pipeline_status[pu][kg]) {
+
+    // Check if the op is still waiting for inputs for a certain task
+    if (std::get<1>(pipeline_status[pu][kg]) &&
+        (inter.entry.job_index != std::get<2>(pipeline_status[pu][kg]) ||
+         inter.entry.task_index != std::get<3>(pipeline_status[pu][kg]))) {
+      // Not your turn.
+    } else if (!std::get<0>(pipeline_status[pu][kg])) {
       work_togo = inter;
+
       // Restore the task order
       i++;
       while (i < buffered_works) {
@@ -92,9 +99,9 @@ bool has_work_to_do(
         i++;
       }
       return true;
-    } else {
-      buffer_queue.push_back(inter);
     }
+
+    buffer_queue.push_back(inter);
   }
   return false;
 }
@@ -228,7 +235,9 @@ void schedule(SchedulerArgs args) {
   IntermediateQueue &result_queue = args.result_queue;
   std::vector<IntermediateQueue> &task_queues = args.task_queues;
   std::vector<OpStage> &pipeline_stages = args.pipeline_stages;
-  std::vector<std::vector<bool>> &pipeline_status = args.pipeline_status;
+  // is occupied, hold by task, job_idx, task_idx
+  std::vector<std::vector<std::tuple<bool, bool, i32, i32>>> &pipeline_status
+    = args.pipeline_status;
   std::deque<Intermediate> buffer_queue;
   Profiler &profiler = args.profiler;
 
@@ -257,10 +266,11 @@ void schedule(SchedulerArgs args) {
       EvalWorkEntry& work_entry = finished.entry;
       auto& task_streams = finished.task_streams;
 
-      //TODO: has_result
-
       OpStage &stage = pipeline_stages[kg];
-      pipeline_status[pu][kg] = false;
+      std::get<0>(pipeline_status[pu][kg]) = false;
+      if (finished.task_end) {
+        std::get<1>(pipeline_status[pu][kg]) = false;
+      }
 
       gen_next_stage_tasks(pu, kg, stage.output_mapping,
         buffer_queue, work_entry, task_streams, args); 
@@ -288,7 +298,10 @@ void schedule(SchedulerArgs args) {
           EvalWorkEntry& work_entry = finished.entry;
           auto& task_streams = finished.task_streams;
           OpStage &stage = pipeline_stages[kg];
-          pipeline_status[pu][kg] = false;
+          std::get<0>(pipeline_status[pu][kg]) = false;
+          if (finished.task_end) {
+            std::get<1>(pipeline_status[pu][kg]) = false;
+          }
 
           //TODO: has_result
           gen_next_stage_tasks(pu, kg, stage.output_mapping,
@@ -312,7 +325,12 @@ void schedule(SchedulerArgs args) {
     free_workers.pop_front();
 
     task_queues[wid].push(work_togo);
-    pipeline_status[work_togo.pu][work_togo.kg] = true;
+    std::get<0>(pipeline_status[work_togo.pu][work_togo.kg]) = true;
+    std::get<1>(pipeline_status[work_togo.pu][work_togo.kg]) = true;
+    std::get<2>(pipeline_status[work_togo.pu][work_togo.kg]) =
+      work_togo.entry.job_index;
+    std::get<3>(pipeline_status[work_togo.pu][work_togo.kg]) =
+      work_togo.entry.task_index;
   }
 }
 
@@ -375,7 +393,7 @@ void worker_thread(IntermediateQueue &task_queue,
             std::chrono::duration_cast<std::chrono::milliseconds>(now() - work_start).count()
             << "ms";
     result_queue.push(Intermediate{pu, kg, task_streams, output_entry,
-        wid, 1});
+        wid, worker.task_end(), false});
   }
 }
 
@@ -983,7 +1001,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   IntermediateQueue result_queue;
   std::vector<IntermediateQueue> task_queues(num_eval_threads);
   std::vector<OpStage> pipeline_stages;
-  std::vector<std::vector<bool>> pipeline_status(
+  std::vector<std::vector<std::tuple<bool,bool,i32,i32>>> pipeline_status(
       pipeline_instances_per_node);
   std::vector<std::vector<std::pair<i32, i32>>> input_col_mapping;
 
@@ -1263,7 +1281,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     DeviceHandle first_kernel_type;
     for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
       // All stages are free in the beginning
-      pipeline_status[ki].push_back(false);
+      pipeline_status[ki].push_back(std::make_tuple(0,0,false,false));
 
       auto& group = groups[kg].kernel_factories;
       std::vector<EvaluateWorkerArgs>& thread_args = eval_args[ki];

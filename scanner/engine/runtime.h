@@ -76,7 +76,7 @@ struct Intermediate {
   EvalWorkEntry entry;
   // For pipeline stage results
   i32 wid;
-  i32 has_result; 
+  bool task_end = false;
   bool is_last = false;
 };
 

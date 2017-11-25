@@ -135,6 +135,7 @@ class EvaluateWorker {
 
   i64 job_idx() {return job_idx_;};
   i64 task_idx() {return task_idx_;};
+  bool task_end();
 
  private:
   void clear_stencil_cache();

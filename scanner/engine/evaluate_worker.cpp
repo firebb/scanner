@@ -289,6 +289,16 @@ EvaluateWorker::~EvaluateWorker() {
   clear_stencil_cache();
 }
 
+bool EvaluateWorker::task_end() {
+  for (size_t i = 0; i < current_valid_input_idx_.size(); ++i) {
+    for (i64 used_rows : current_valid_input_idx_[i]) {
+      if (valid_input_rows_[i].size() != used_rows)
+        return false;
+    }
+  }
+  return true;
+}
+
 void EvaluateWorker::new_task(i64 job_idx, i64 task_idx,
                               const std::vector<TaskStream>& task_streams) {
   job_idx_ = job_idx;
