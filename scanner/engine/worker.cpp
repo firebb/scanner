@@ -118,6 +118,7 @@ void gen_next_stage_tasks(i32 pu, i32 kg,
   std::vector<OpStage> &pipeline_stages = sArgs.pipeline_stages;
   std::vector<EvalQueue> &post_input_queues = sArgs.post_input_queues;
 
+  auto gen_next_start = now();
   std::set<i32> next_stages;
   if (kg == -1) {
     // kg == -1 indicates input from pre_eval
@@ -219,6 +220,7 @@ void gen_next_stage_tasks(i32 pu, i32 kg,
     output_columns[col].clear();
     output_row_ids.clear();
   }
+  profiler.add_interval("gen_next", gen_next_start, now());
 }
 
 void schedule(SchedulerArgs args) {
@@ -250,7 +252,9 @@ void schedule(SchedulerArgs args) {
   while (true) {
     if (free_workers.size() == 0) {
       Intermediate finished;
+      auto idle_start = now();
       result_queue.pop(finished);
+      profiler.add_interval("idle pull", idle_start, now());
       if (finished.is_last) {
         num_active_threads --;
         if (num_active_threads == 0) {
@@ -277,6 +281,7 @@ void schedule(SchedulerArgs args) {
     }
 
     Intermediate work_togo;
+    auto wait_task_start = now();
     while (!has_work_to_do(buffer_queue, pipeline_status, work_togo)) {
       i32 pu = -1;
       std::tuple<std::deque<TaskStream>, EvalWorkEntry> input;
@@ -291,8 +296,8 @@ void schedule(SchedulerArgs args) {
             }
             continue;
           }
-          VLOG(1) << "Scheduler receive result from worker " << finished.wid;
           free_workers.push_back(finished.wid);
+          VLOG(1) << "Scheduler receive result from worker " << finished.wid;
           i32 pu = finished.pu;
           i32 kg = finished.kg;
           EvalWorkEntry& work_entry = finished.entry;
@@ -315,6 +320,7 @@ void schedule(SchedulerArgs args) {
           buffer_queue, std::get<1>(input), std::get<0>(input), args); 
       }
     }
+    profiler.add_interval("wait task", wait_task_start, now());
 
     assert(free_workers.size() != 0);
     // Assign work
@@ -392,6 +398,7 @@ void worker_thread(IntermediateQueue &task_queue,
             << ", " << work_entry.task_index << " in " << 
             std::chrono::duration_cast<std::chrono::milliseconds>(now() - work_start).count()
             << "ms";
+
     result_queue.push(Intermediate{pu, kg, task_streams, output_entry,
         wid, worker.task_end(), false});
   }
@@ -996,8 +1003,16 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   i32 num_eval_threads = job_params->num_eval_threads();
   VLOG(1) << "Num worker threads: " << num_eval_threads;
 
-  std::vector<EvalQueue> post_input_queues(pipeline_instances_per_node);
-  std::vector<EvalQueue> pre_output_queues(pipeline_instances_per_node);
+  std::vector<EvalQueue> post_input_queues;
+  for (i32 i = 0; i < pipeline_instances_per_node; i++) {
+    // Set enough buffer size for output queue
+    post_input_queues.emplace_back(1000);
+  }
+  std::vector<EvalQueue> pre_output_queues;
+  for (i32 i = 0; i < pipeline_instances_per_node; i++) {
+    // Reduce the frame read into the buffer
+    pre_output_queues.emplace_back(2);
+  }
   IntermediateQueue result_queue;
   std::vector<IntermediateQueue> task_queues(num_eval_threads);
   std::vector<OpStage> pipeline_stages;
@@ -1747,7 +1762,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
 
   i64 out_rank = node_id_;
   // Load worker profilers
-  u8 load_worker_count = num_load_workers + num_eval_threads;
+  u8 load_worker_count = num_load_workers + num_eval_threads + 1;
   s_write(profiler_output.get(), load_worker_count);
   for (i32 i = 0; i < num_load_workers; ++i) {
     write_profiler_to_file(profiler_output.get(), out_rank, "load", "", i,
@@ -1762,6 +1777,9 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     write_profiler_to_file(profiler_output.get(), out_rank, "eval", tag, wid,
                              eval_thread_profilers[wid]);
   }
+
+  write_profiler_to_file(profiler_output.get(), out_rank, "eval", "sched", 0,
+                           scheduler_profiler);
 
   // Pre/Post Evaluate worker profilers
   u8 prepost_worker_count = pipeline_instances_per_node;
