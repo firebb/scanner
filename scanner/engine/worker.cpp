@@ -1145,7 +1145,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       cm.push_back(column_mapping[kg]);
       st.push_back(analysis_results.stencils[i]);
       bt.push_back(analysis_results.batch_sizes[i]);
-      groups.back().task_streams_start = op_counter;
+      groups.back().task_streams_start = op_counter++;
       kg++;
     }
     sArgs.num_ops = op_counter;
