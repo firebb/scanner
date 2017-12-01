@@ -76,32 +76,40 @@ bool has_work_to_do(
   i32 buffered_works = buffer_queue.size();
   if (buffered_works == 0) return false;
 
-  for (i32 i = 0; i < buffered_works; i++) {
-    Intermediate inter = buffer_queue.front();
-    buffer_queue.pop_front();
-    i32 pu = inter.pu;
-    i32 kg = inter.kg;
-
-    // Check if the op is still waiting for inputs for a certain task
-    if (std::get<1>(pipeline_status[pu][kg]) &&
-        (inter.entry.job_index != std::get<2>(pipeline_status[pu][kg]) ||
-         inter.entry.task_index != std::get<3>(pipeline_status[pu][kg]))) {
-      // Not your turn.
-    } else if (!std::get<0>(pipeline_status[pu][kg])) {
-      work_togo = inter;
-
-      // Restore the task order
-      i++;
-      while (i < buffered_works) {
-        inter = buffer_queue.front();
-        buffer_queue.pop_front();
+  for (i32 i = 0; i < pipeline_status.size(); i++) {
+    for (i32 j = 0; j < buffered_works; j++) {
+      Intermediate inter = buffer_queue.front();
+      buffer_queue.pop_front();
+      i32 pu = inter.pu;
+      i32 kg = inter.kg;
+      if (pu != i) {
+        // Scheduler would prefer to finish one instance before
+        // executing another to reduce memory footprint
         buffer_queue.push_back(inter);
-        i++;
+        continue;
       }
-      return true;
-    }
 
-    buffer_queue.push_back(inter);
+      // Check if the op is still waiting for inputs for a certain task
+      if (std::get<1>(pipeline_status[pu][kg]) &&
+          (inter.entry.job_index != std::get<2>(pipeline_status[pu][kg]) ||
+           inter.entry.task_index != std::get<3>(pipeline_status[pu][kg]))) {
+        // Not your turn.
+      } else if (!std::get<0>(pipeline_status[pu][kg])) {
+        work_togo = inter;
+
+        // Restore the task order
+        j++;
+        while (j < buffered_works) {
+          inter = buffer_queue.front();
+          buffer_queue.pop_front();
+          buffer_queue.push_back(inter);
+          j++;
+        }
+        return true;
+      }
+
+      buffer_queue.push_back(inter);
+    }
   }
   return false;
 }
