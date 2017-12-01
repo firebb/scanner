@@ -783,18 +783,27 @@ void copy_or_ref_buffers(std::vector<u8*>& dest_buffers,
                                        dest_device, dest_buffers[i]);
   }
 #else
-  size_t total_size = 0;
-  for (auto size : sizes) {
-    total_size += size;
-  }
+  if ((dest_device.type == DeviceType::CPU &&
+       src_device.type == DeviceType::CPU) ||
+      dest_device == src_device) {
+    for (u8* b : src_buffers) {
+      add_buffer_ref(src_device, b);
+    }
+    dest_buffers = src_buffers;
+  } else {
+    size_t total_size = 0;
+    for (auto size : sizes) {
+      total_size += size;
+    }
 
-  BlockAllocator* dest_allocator = block_allocator_for_device(dest_device);
-  u8* dest_buff = dest_allocator->allocate(total_size, sizes.size());
-  for (size_t size : sizes) {
-    dest_buffers.push_back(dest_buff);
-    dest_buff += size;
+    BlockAllocator* dest_allocator = block_allocator_for_device(dest_device);
+    u8* dest_buff = dest_allocator->allocate(total_size, sizes.size());
+    for (size_t size : sizes) {
+      dest_buffers.push_back(dest_buff);
+      dest_buff += size;
+    }
+    memcpy_vec(dest_buffers, dest_device, src_buffers, src_device, sizes);
   }
-  memcpy_vec(dest_buffers, dest_device, src_buffers, src_device, sizes);
 #endif
 }
 
