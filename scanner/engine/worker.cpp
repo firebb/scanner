@@ -71,7 +71,8 @@ i32 wait_for_input(std::vector<EvalQueue> &pre_output_queues,
 
 bool has_work_to_do(
     std::deque<Intermediate> &buffer_queue,
-    std::vector<std::vector<std::tuple<bool,bool,i32,i32>>> &pipeline_status,
+    std::vector<std::vector<OpStatus>> &pipeline_status,
+    std::vector<bool> &gpu_status,
     Intermediate &work_togo) {
   i32 buffered_works = buffer_queue.size();
   if (buffered_works == 0) return false;
@@ -90,22 +91,31 @@ bool has_work_to_do(
       }
 
       // Check if the op is still waiting for inputs for a certain task
-      if (std::get<1>(pipeline_status[pu][kg]) &&
-          (inter.entry.job_index != std::get<2>(pipeline_status[pu][kg]) ||
-           inter.entry.task_index != std::get<3>(pipeline_status[pu][kg]))) {
+      if (pipeline_status[pu][kg].reserve_by_task &&
+          (inter.entry.job_index != pipeline_status[pu][kg].job_index ||
+           inter.entry.task_index != pipeline_status[pu][kg].task_index)) {
         // Not your turn.
-      } else if (!std::get<0>(pipeline_status[pu][kg])) {
-        work_togo = inter;
-
-        // Restore the task order
-        j++;
-        while (j < buffered_works) {
-          inter = buffer_queue.front();
-          buffer_queue.pop_front();
-          buffer_queue.push_back(inter);
-          j++;
+      } else if (!pipeline_status[pu][kg].running) {
+        // For GPUs, we need to check if the device is busy
+        bool device_busy = false;
+        if (pipeline_status[pu][kg].device_type == DeviceType::GPU) {
+          for (i32 device_id : pipeline_status[pu][kg].device_ids) {
+            device_busy |= gpu_status[device_id];
+          }
         }
-        return true;
+        if (!device_busy) {
+          work_togo = inter;
+
+          // Restore the task order
+          j++;
+          while (j < buffered_works) {
+            inter = buffer_queue.front();
+            buffer_queue.pop_front();
+            buffer_queue.push_back(inter);
+            j++;
+          }
+          return true;
+        }
       }
 
       buffer_queue.push_back(inter);
@@ -233,6 +243,7 @@ void gen_next_stage_tasks(i32 pu, i32 kg,
 
 void schedule(SchedulerArgs args) {
   std::deque<i32> free_workers;
+  i32 num_gpu_threads = args.num_gpu_threads;
   i32 num_eval_threads = args.num_eval_threads;
   i32 num_active_threads = num_eval_threads;
   i32 pipeline_instances_per_node = args.pipeline_instances_per_node;
@@ -246,9 +257,10 @@ void schedule(SchedulerArgs args) {
   std::vector<IntermediateQueue> &task_queues = args.task_queues;
   std::vector<OpStage> &pipeline_stages = args.pipeline_stages;
   // is occupied, hold by task, job_idx, task_idx
-  std::vector<std::vector<std::tuple<bool, bool, i32, i32>>> &pipeline_status
+  std::vector<std::vector<OpStatus>> &pipeline_status
     = args.pipeline_status;
   std::deque<Intermediate> buffer_queue;
+  std::vector<bool> gpu_status(num_gpu_threads, false);
   Profiler &profiler = args.profiler;
 
   for (i32 wid = 0; wid < num_eval_threads; wid++) {
@@ -279,9 +291,15 @@ void schedule(SchedulerArgs args) {
       auto& task_streams = finished.task_streams;
 
       OpStage &stage = pipeline_stages[kg];
-      std::get<0>(pipeline_status[pu][kg]) = false;
+      pipeline_status[pu][kg].running = false;
       if (finished.task_end) {
-        std::get<1>(pipeline_status[pu][kg]) = false;
+        pipeline_status[pu][kg].reserve_by_task = false;
+      }
+      // Set GPU devices to be free
+      if (pipeline_status[pu][kg].device_type == DeviceType::GPU) {
+        for (i32 device_id: pipeline_status[pu][kg].device_ids) {
+          gpu_status[device_id] = false;
+        }
       }
 
       gen_next_stage_tasks(pu, kg, stage.output_mapping,
@@ -290,7 +308,7 @@ void schedule(SchedulerArgs args) {
 
     Intermediate work_togo;
     auto wait_task_start = now();
-    while (!has_work_to_do(buffer_queue, pipeline_status, work_togo)) {
+    while (!has_work_to_do(buffer_queue, pipeline_status, gpu_status, work_togo)) {
       i32 pu = -1;
       std::tuple<std::deque<TaskStream>, EvalWorkEntry> input;
       if ((pu = wait_for_input(pre_output_queues, input)) == -1) {
@@ -311,9 +329,15 @@ void schedule(SchedulerArgs args) {
           EvalWorkEntry& work_entry = finished.entry;
           auto& task_streams = finished.task_streams;
           OpStage &stage = pipeline_stages[kg];
-          std::get<0>(pipeline_status[pu][kg]) = false;
+          pipeline_status[pu][kg].running = false;
           if (finished.task_end) {
-            std::get<1>(pipeline_status[pu][kg]) = false;
+            pipeline_status[pu][kg].reserve_by_task = false;
+          }
+          // Set GPU devices to be free
+          if (pipeline_status[pu][kg].device_type == DeviceType::GPU) {
+            for (i32 device_id: pipeline_status[pu][kg].device_ids) {
+              gpu_status[device_id] = false;
+            }
           }
 
           //TODO: has_result
@@ -339,12 +363,21 @@ void schedule(SchedulerArgs args) {
     free_workers.pop_front();
 
     task_queues[wid].push(work_togo);
-    std::get<0>(pipeline_status[work_togo.pu][work_togo.kg]) = true;
-    std::get<1>(pipeline_status[work_togo.pu][work_togo.kg]) = true;
-    std::get<2>(pipeline_status[work_togo.pu][work_togo.kg]) =
+    pipeline_status[work_togo.pu][work_togo.kg].running = true;
+    pipeline_status[work_togo.pu][work_togo.kg].reserve_by_task = true;
+    pipeline_status[work_togo.pu][work_togo.kg].job_index =
       work_togo.entry.job_index;
-    std::get<3>(pipeline_status[work_togo.pu][work_togo.kg]) =
+    pipeline_status[work_togo.pu][work_togo.kg].task_index =
       work_togo.entry.task_index;
+
+    // Set GPU devices to be busy
+    if (pipeline_status[work_togo.pu][work_togo.kg].device_type
+        == DeviceType::GPU) {
+      for (i32 device_id :
+          pipeline_status[work_togo.pu][work_togo.kg].device_ids) {
+        gpu_status[device_id] == true;
+      }
+    }
   }
 }
 
@@ -1009,7 +1042,12 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   Profiler scheduler_profiler(base_time);
   i32 pipeline_instances_per_node = job_params->pipeline_instances_per_node();
   i32 num_eval_threads = job_params->num_eval_threads();
-  VLOG(1) << "Num worker threads: " << num_eval_threads;
+  VLOG(1) << "Num cpu threads: " << num_eval_threads;
+  // TODO: conflict with num_gpus setting, may fix latter
+  i32 num_gpu_threads = job_params->num_gpu_threads();
+  VLOG(1) << "Num gpu threads: " << num_gpu_threads;
+  num_eval_threads = num_eval_threads + num_gpu_threads;
+  VLOG(1) << "Num total eval threads: " << num_eval_threads;
 
   std::vector<EvalQueue> post_input_queues;
   for (i32 i = 0; i < pipeline_instances_per_node; i++) {
@@ -1024,7 +1062,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
   IntermediateQueue result_queue;
   std::vector<IntermediateQueue> task_queues(num_eval_threads);
   std::vector<OpStage> pipeline_stages;
-  std::vector<std::vector<std::tuple<bool,bool,i32,i32>>> pipeline_status(
+  std::vector<std::vector<OpStatus>> pipeline_status(
       pipeline_instances_per_node);
   std::vector<std::vector<std::pair<i32, i32>>> input_col_mapping;
 
@@ -1037,6 +1075,7 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
                       pipeline_status,
                       scheduler_profiler);
   sArgs.num_eval_threads = num_eval_threads;
+  sArgs.num_gpu_threads = num_gpus_threads;
   sArgs.pipeline_instances_per_node = pipeline_instances_per_node;
   sArgs.num_post_col = ops.back().inputs().size();
 
@@ -1303,10 +1342,11 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
     // Evaluate worker
     DeviceHandle first_kernel_type;
     for (i32 kg = 0; kg < num_kernel_groups; ++kg) {
-      // All stages are free in the beginning
-      pipeline_status[ki].push_back(std::make_tuple(0,0,false,false));
-
       auto& group = groups[kg].kernel_factories;
+
+      // Init op status
+      OpStatus op;
+
       std::vector<EvaluateWorkerArgs>& thread_args = eval_args[ki];
       // HACK(apoms): we assume all ops in a kernel group use the
       //   same number of devices for now.
@@ -1323,6 +1363,8 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
         device_type = factory->get_device_type();
         max_devices = factory->get_max_devices();
       }
+
+      op.device_type = device_type;
       if (device_type == DeviceType::CPU) {
         for (i32 i = 0; i < max_devices; ++i) {
           i32 device_id = 0;
@@ -1331,15 +1373,18 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
             KernelConfig& config = std::get<1>(group[i]);
             config.devices.clear();
             config.devices.push_back({device_type, device_id});
+            op.device_ids.push_back(device_id);
           }
         }
       } else {
+        // For a single pipeline instance only use one gpu device
         for (i32 i = 0; i < max_devices; ++i) {
-          i32 device_id = gpu_ids[next_gpu_idx++ % num_gpus];
+          i32 device_id = gpu_ids[ki % num_gpus];
           for (size_t i = 0; i < group.size(); ++i) {
             KernelConfig& config = std::get<1>(group[i]);
             config.devices.clear();
             config.devices.push_back({device_type, device_id});
+            op.device_ids.push_back(device_id);
           }
         }
       }
@@ -1347,6 +1392,9 @@ grpc::Status WorkerImpl::NewJob(grpc::ServerContext* context,
       if (kg == 0) {
         first_kernel_type = std::get<1>(group[0]).devices[0];
       }
+
+      // Add op into the pipeline status
+      pipeline_status[ki].push_back(op);
 
       thread_args.emplace_back(EvaluateWorkerArgs{
           // Uniform arguments

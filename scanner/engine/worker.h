@@ -28,8 +28,19 @@
 
 namespace scanner {
 namespace internal {
+struct OpStatus {
+  bool running = false;
+  bool reserve_by_task = false;
+  i32 job_index = -1;
+  i32 task_index = -1;
+  DeviceType device_type;
+  std::vector<i32> device_ids;
+};
+
 
 struct SchedulerArgs{
+  // Num gpu devices
+  i32 num_gpu_threads;
   // Num worker threads
   i32 num_eval_threads;
   // Num instances
@@ -51,7 +62,7 @@ struct SchedulerArgs{
   // Pipeline stages
   std::vector<OpStage> &pipeline_stages;
   // Pipeline status 
-  std::vector<std::vector<std::tuple<bool,bool,i32,i32>>> &pipeline_status;
+  std::vector<std::vector<OpStatus>> &pipeline_status;
   // Profiler
   Profiler &profiler;
 
@@ -61,7 +72,7 @@ struct SchedulerArgs{
       IntermediateQueue &result, 
       std::vector<IntermediateQueue> &task,
       std::vector<OpStage> &stages,
-      std::vector<std::vector<std::tuple<bool,bool,i32,i32>>> &status,
+      std::vector<std::vector<OpStatus>> &status,
       Profiler &prof)
    : pre_output_queues(pre),
      post_input_queues(post),
