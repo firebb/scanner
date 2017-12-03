@@ -943,7 +943,8 @@ class Database(object):
             profiling=False,
             load_sparsity_threshold=8,
             tasks_in_queue_per_pu=4,
-            num_eval_threads=1):
+            num_eval_threads=0,
+            num_gpu_threads=0):
         """
         Runs a computation over a set of inputs.
 
@@ -1063,6 +1064,7 @@ class Database(object):
         job_params.boundary_condition = (
             self.protobufs.BulkJobParameters.REPEAT_EDGE)
         job_params.num_eval_threads = num_eval_threads;
+        job_params.num_gpu_threads = num_gpu_threads;
 
         job_params.memory_pool_config.pinned_cpu = False
         if cpu_pool is not None:

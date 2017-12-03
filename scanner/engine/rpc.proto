@@ -136,6 +136,7 @@ message BulkJobParameters {
   };
   BoundaryCondition boundary_condition = 15;
   int32 num_eval_threads = 16;
+  int32 num_gpu_threads = 17;
 }
 
 message NewWork {
